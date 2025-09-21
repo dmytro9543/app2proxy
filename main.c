@@ -7,6 +7,7 @@
 #include <sys/statvfs.h>
 #include <stdbool.h>
 #include <sys/inotify.h>
+#include <regex.h>
 
 #include "mongoose.h"
 
