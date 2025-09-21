@@ -17,6 +17,7 @@
 #define MAX_PROXY_LEN 256
 #define MAX_RESPONSE_LEN 1024
 #define CURL_TIMEOUT 2
+#define MAX_IP_LENGTH 16  // "xxx.xxx.xxx.xxx" + null terminator
 
 int main_pid = 0;
 int no_fork = 0;
@@ -645,20 +646,11 @@ int main(int argc, char* argv[])
   if(set_sighandler(sig_usr_un))
   	return -1;
 
-  memset(&monitor, 0, sizeof(monitor));
-  pthread_mutex_init(&monitor.buffer_mutex, NULL);
-
-  int rc = pthread_create(&thread_id, NULL, api_thread_function, NULL);
+  /*int rc = pthread_create(&thread_id, NULL, api_thread_function, NULL);
   if (rc != 0) {
       fprintf(stderr, "Error creating thread: %d\n", rc);
       return EXIT_FAILURE;
-  }
-
-  rc = pthread_create(&cpu_thread, NULL, resource_usage_thread, NULL);
-  if (rc != 0) {
-      fprintf(stderr, "Error creating thread: %d\n", rc);
-      return EXIT_FAILURE;
-  }
+  }*/
 
   /*rc = pthread_create(&mem_thread, NULL, mem_usage_thread, NULL);
   if (rc != 0) {
@@ -669,7 +661,7 @@ int main(int argc, char* argv[])
  
   struct mg_mgr mgr;  // Declare event manager
   mg_mgr_init(&mgr);  // Initialise event manager
-  mg_http_listen(&mgr, "http://0.0.0.0:9480", ev_handler, NULL);  // Setup listener
+  mg_http_listen(&mgr, "http://0.0.0.0:8080", api_ev_handler, NULL);  // Setup listener
   for (;;) {          // Run an infinite event loop
     mg_mgr_poll(&mgr, 1000);
   }
@@ -677,7 +669,7 @@ int main(int argc, char* argv[])
   printf("Main thread: Waiting for new thread to finish...\n");
 
   // Wait for the thread to complete
-  rc = pthread_join(thread_id, NULL);
+  /*rc = pthread_join(thread_id, NULL);
   if (rc != 0) {
       fprintf(stderr, "Error joining thread: %d\n", rc);
   }
@@ -685,7 +677,7 @@ int main(int argc, char* argv[])
   rc = pthread_join(cpu_thread, NULL);
   if (rc != 0) {
       fprintf(stderr, "Error joining thread: %d\n", rc);
-  }
+  }*/
   
   /*rc = pthread_join(mem_thread, NULL);
   if (rc != 0) {
