@@ -8,6 +8,9 @@
 #include <stdbool.h>
 #include <sys/inotify.h>
 #include <regex.h>
+#include <time.h>
+#include <net/if.h>
+#include <netinet/in.h>
 
 #include "mongoose.h"
 
@@ -18,6 +21,7 @@
 #define MAX_PROXY_LEN 256
 #define MAX_RESPONSE_LEN 1024
 #define CURL_TIMEOUT 2
+#define DEFAULT_COUNT 3
 #define MAX_IP_LENGTH 16  // "xxx.xxx.xxx.xxx" + null terminator
 
 int main_pid = 0;
@@ -38,6 +42,8 @@ char* test_all_proxies(const char* proxy);
 bool is_ipv4(const char* ip);
 bool is_ipv6(const char* ip);
 void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm);
+void generate_ipv6_addresses(int count, const char* interface);
+static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm);
 
 static void sig_usr_un(int signo)
 {
@@ -108,6 +114,35 @@ static void run_command(char *command) {
 
   printf("%s\nScript executed successfully.\n", command);
 
+}
+
+static void parse_query(const char* query, char* ip, int* count) 
+{
+    // Initialize defaults
+    *count = DEFAULT_COUNT;
+    ip[0] = '\0';
+    
+    // Temporary variables
+    char* token;
+    char* rest = (char*)query;
+    
+    // Use strtok_r to safely tokenize the query string
+    while ((token = strtok_r(rest, "&", &rest))) {
+        if (strncmp(token, "ip=", 3) == 0) {
+            // Found IP parameter
+            strncpy(ip, token + 3, MAX_IP_LENGTH - 1);
+            ip[MAX_IP_LENGTH - 1] = '\0';  // Ensure null-termination
+            
+            // Remove any trailing parameters from IP (in case of malformed input)
+            char* param_end = strchr(ip, '&');
+            if (param_end) *param_end = '\0';
+        }
+        else if (strncmp(token, "count=", 6) == 0) {
+            // Found count parameter
+            *count = atoi(token + 6);
+            if (*count <= 0) *count = DEFAULT_COUNT;  // Validate count
+        }
+    }
 }
 
 static char* convert_to_valid_json(const char* input) {
@@ -278,7 +313,7 @@ bool is_ipv6(const char* ip) {
 // Handle the /test-proxies endpoint
 void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm) {
     // Parse JSON body manually (simple approach)
-    char *body = strndup(hm->body.ptr, hm->body.len);
+    char *body = strndup(hm->body.buf, hm->body.len);
     char *proxies_start = strstr(body, "\"proxies\":");
     char *type_start = strstr(body, "\"type\":");
     
@@ -379,6 +414,245 @@ void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm) {
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response);
     
     free(response);
+    free(body);
+}
+
+void generate_ipv6_addresses(int count, const char* interface) {
+    char ip6_prefix[INET6_ADDRSTRLEN] = {0};
+    FILE *fp;
+    char command[256];
+    
+    // Try to get IPv6 prefix from system
+    fp = popen("ip -6 addr | grep 'inet6 [23]' | head -1", "r");
+    if (fp) {
+        if (fgets(command, sizeof(command), fp)) {
+            // Extract the IP address part
+            char *slash = strchr(command, '/');
+            if (slash) *slash = '\0';
+            
+            // Find the last colon to get the prefix
+            char *last_colon = strrchr(command, ':');
+            if (last_colon) {
+                *last_colon = '\0';
+                strncpy(ip6_prefix, command, INET6_ADDRSTRLEN - 1);
+            }
+        }
+        pclose(fp);
+    }
+    
+    // If no prefix found from system, try icanhazip.com
+    if (strlen(ip6_prefix) == 0) {
+        fp = popen("curl -6 -s icanhazip.com", "r");
+        if (fp) {
+            if (fgets(ip6_prefix, sizeof(ip6_prefix), fp)) {
+                // Remove newline
+                ip6_prefix[strcspn(ip6_prefix, "\n")] = 0;
+                
+                // Extract prefix (first 4 groups)
+                int colons = 0;
+                char *p = ip6_prefix;
+                while (*p && colons < 4) {
+                    if (*p == ':') colons++;
+                    p++;
+                }
+                if (colons == 4) *p = '\0';
+            }
+            pclose(fp);
+        }
+    }
+    
+    // If still no prefix, use a default
+    if (strlen(ip6_prefix) == 0) {
+        strcpy(ip6_prefix, "2001:db8::");
+    }
+    
+    // Array of hex digits
+    const char hex_digits[] = "0123456789abcdef";
+    
+    // Create the script file
+    FILE *script = fopen("ipnew.sh", "w");
+    if (!script) {
+        perror("Failed to create ipnew.sh");
+        return;
+    }
+    
+    fprintf(script, "#!/bin/bash\n");
+    
+    // Generate the IPv6 addresses
+    srand(time(NULL));
+    for (int i = 0; i < count; i++) {
+        // Generate 4 random groups for the interface ID
+        char groups[4][5];
+        for (int j = 0; j < 4; j++) {
+            for (int k = 0; k < 4; k++) {
+                groups[j][k] = hex_digits[rand() % 16];
+            }
+            groups[j][4] = '\0';
+        }
+        
+        // Format the full IPv6 address
+        fprintf(script, "ip -6 addr add %s:%s:%s:%s:%s/64 dev %s\n", 
+                ip6_prefix, groups[0], groups[1], groups[2], groups[3], interface);
+    }
+    
+    fclose(script);
+    
+    // Make the script executable
+    chmod("ipnew.sh", 0755);
+    
+    printf("Generated %d IPv6 addresses for interface %s\n", count, interface);
+}
+
+// HTTP handler for the IPv6 generation endpoint
+static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body = strndup(hm->body.buf, hm->body.len);
+    char *count_str = strstr(body, "\"count\":");
+    char *interface_str = strstr(body, "\"interface\":");
+    
+    int count = 10; // Default value
+    char interface[IFNAMSIZ] = "eth0"; // Default interface
+    
+    if (count_str) {
+        count = atoi(count_str + 8); // Skip "\"count\":"
+        if (count < 1) count = 1;
+        if (count > 10000) count = 10000;
+    }
+    
+    if (interface_str) {
+        // Find the value after "interface":"
+        char *start = strchr(interface_str + 12, '"');
+        if (start) {
+            start++;
+            char *end = strchr(start, '"');
+            if (end) {
+                int len = end - start;
+                if (len > IFNAMSIZ - 1) len = IFNAMSIZ - 1;
+                strncpy(interface, start, len);
+                interface[len] = '\0';
+            }
+        }
+    }
+    
+    free(body);
+    
+    // Generate the IPv6 addresses
+    generate_ipv6_addresses(count, interface);
+    
+    // Return success response
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                  "{\"status\":\"success\", \"message\":\"Generated %d IPv6 addresses for interface %s\"}\n", 
+                  count, interface);
+}
+
+bool ping_ipv6(const char *ipv6_address) {
+    char command[256];
+    snprintf(command, sizeof(command), "ping6 -c 1 -W 1 %s 2>&1", ipv6_address);
+    
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        return false;
+    }
+    
+    // Read the output to check for success
+    char buffer[128];
+    bool reachable = false;
+    
+    while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+        // Check for successful ping response
+        if (strstr(buffer, "1 packets transmitted, 1 received") != NULL ||
+            strstr(buffer, "1 packets transmitted, 1 packets received") != NULL) {
+            reachable = true;
+            break;
+        }
+    }
+    
+    pclose(fp);
+    return reachable;
+}
+
+// HTTP handler for IPv6 ping test
+static void handle_ipv6_ping_test(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body = strndup(hm->body.buf, hm->body.len);
+    char *ipv6_array_start = strstr(body, "\"ipv6_address\":[");
+    
+    if (!ipv6_array_start) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON format. Expected ipv6_address array.\"}\n");
+        free(body);
+        return;
+    }
+    
+    // Move to the start of the array
+    ipv6_array_start = strchr(ipv6_array_start, '[') + 1;
+    char *ipv6_array_end = strchr(ipv6_array_start, ']');
+    
+    if (!ipv6_array_end) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON format. Array not properly closed.\"}\n");
+        free(body);
+        return;
+    }
+    
+    // Calculate the length of the array content
+    size_t array_len = ipv6_array_end - ipv6_array_start;
+    char *array_content = malloc(array_len + 1);
+    strncpy(array_content, ipv6_array_start, array_len);
+    array_content[array_len] = '\0';
+    
+    // Start building the response
+    char *response = malloc(4096);
+    if (!response) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}\n");
+        free(body);
+        free(array_content);
+        return;
+    }
+    
+    strcpy(response, "[");
+    
+    // Parse IPv6 addresses from the array
+    char *token = strtok(array_content, "\",");
+    bool first = true;
+    
+    while (token) {
+        // Skip whitespace and quotes
+        while (*token == ' ' || *token == '"') token++;
+        
+        // Remove trailing quote if present
+        char *end = token + strlen(token) - 1;
+        while (end > token && (*end == ' ' || *end == '"')) {
+            *end = '\0';
+            end--;
+        }
+        
+        if (strlen(token) > 0) {
+            // Ping the IPv6 address
+            bool reachable = ping_ipv6(token);
+            
+            // Add to response
+            if (!first) strcat(response, ",");
+            
+            strcat(response, "{\"ipv6\":\"");
+            strcat(response, token);
+            strcat(response, "\",\"status\":\"");
+            strcat(response, reachable ? "OK" : "FAIL");
+            strcat(response, "\"}");
+            
+            first = false;
+        }
+        
+        token = strtok(NULL, "\",");
+    }
+    
+    strcat(response, "]");
+    
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s\n", response);
+    
+    free(response);
+    free(array_content);
     free(body);
 }
 
@@ -575,6 +849,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         handle_test_proxies(c, hm);
         return;
       }
+      else if (mg_match(hm->uri, mg_str("/generate-ipv6"), NULL)) {
+        handle_generate_ipv6(c, hm);
+        return;
+      }
       else if( mg_match(hm->uri, mg_str("/delvlan"), NULL) ) {
         char vlans[128];
         if(!strncmp(hm->body.buf, "vlans=", 6)) {
@@ -582,12 +860,16 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           strncpy(vlans, hm->body.buf + 6, len);
           vlans[ len ] = '\0';
 
-          del_vlan(vlans);
+          //del_vlan(vlans);
 
           mg_http_reply(c, 200, "", "{\"result\":\"%m\"}\n", MG_ESC("success")); 
         } else {
           mg_http_reply(c, 500, "", "{\"%m\":\"%m\"}\n", MG_ESC("error"), MG_ESC("Syntax Error")); 
         }
+      }
+      else if (mg_match(hm->uri, mg_str("/ipv6-ping-test"), NULL)) {
+        handle_ipv6_ping_test(c, hm);
+        return;
       }
       else {
         goto send_errmsg;
