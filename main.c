@@ -583,89 +583,72 @@ bool ping_ipv6(const char *ipv6_address) {
     return reachable;
 }
 
-// HTTP handler for IPv6 ping test
 static void handle_ipv6_ping_test(struct mg_connection *c, struct mg_http_message *hm) {
-    // Parse JSON body
-    char *body = strndup(hm->body.buf, hm->body.len);
-    char *ipv6_array_start = strstr(body, "\"ipv6_address\":[");
-    
-    if (!ipv6_array_start) {
-        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
-                      "{\"error\":\"Invalid JSON format. Expected ipv6_address array.\"}\n");
-        free(body);
-        return;
-    }
-    
-    // Move to the start of the array
-    ipv6_array_start = strchr(ipv6_array_start, '[') + 1;
-    char *ipv6_array_end = strchr(ipv6_array_start, ']');
-    
-    if (!ipv6_array_end) {
-        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
-                      "{\"error\":\"Invalid JSON format. Array not properly closed.\"}\n");
-        free(body);
-        return;
-    }
-    
-    // Calculate the length of the array content
-    size_t array_len = ipv6_array_end - ipv6_array_start;
-    char *array_content = malloc(array_len + 1);
-    strncpy(array_content, ipv6_array_start, array_len);
-    array_content[array_len] = '\0';
-    
-    // Start building the response
-    char *response = malloc(4096);
-    if (!response) {
+    // Parse JSON body using json-c
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
         mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
-                      "{\"error\":\"Memory allocation failed\"}\n");
-        free(body);
-        free(array_content);
+                      "{\"error\":\"Memory allocation failed\"}");
         return;
     }
     
-    strcpy(response, "[");
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
     
-    // Parse IPv6 addresses from the array
-    char *token = strtok(array_content, "\",");
-    bool first = true;
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
     
-    while (token) {
-        // Skip whitespace and quotes
-        while (*token == ' ' || *token == '"') token++;
-        
-        // Remove trailing quote if present
-        char *end = token + strlen(token) - 1;
-        while (end > token && (*end == ' ' || *end == '"')) {
-            *end = '\0';
-            end--;
-        }
-        
-        if (strlen(token) > 0) {
-            // Ping the IPv6 address
-            bool reachable = ping_ipv6(token);
-            
-            // Add to response
-            if (!first) strcat(response, ",");
-            
-            strcat(response, "{\"ipv6\":\"");
-            strcat(response, token);
-            strcat(response, "\",\"status\":\"");
-            strcat(response, reachable ? "OK" : "FAIL");
-            strcat(response, "\"}");
-            
-            first = false;
-        }
-        
-        token = strtok(NULL, "\",");
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
     }
     
-    strcat(response, "]");
+    // Extract IPv6 addresses array
+    json_object *ipv6_array_obj;
+    if (!json_object_object_get_ex(root, "ipv6_address", &ipv6_array_obj) || 
+        !json_object_is_type(ipv6_array_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing ipv6_address array\"}");
+        return;
+    }
     
-    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s\n", response);
+    // Create response array
+    json_object *response_array = json_object_new_array();
     
-    free(response);
-    free(array_content);
-    free(body);
+    // Process each IPv6 address
+    int array_len = json_object_array_length(ipv6_array_obj);
+    for (int i = 0; i < array_len; i++) {
+        json_object *ipv6_item = json_object_array_get_idx(ipv6_array_obj, i);
+        
+        if (!json_object_is_type(ipv6_item, json_type_string)) {
+            continue; // Skip non-string items
+        }
+        
+        const char *ipv6_address = json_object_get_string(ipv6_item);
+        
+        // Create result object for this IP
+        json_object *result_obj = json_object_new_object();
+        
+        // Add the IP address to the result
+        json_object_object_add(result_obj, "ipv6", json_object_new_string(ipv6_address));
+        
+        // Ping the IPv6 address and add status
+        bool reachable = ping_ipv6(ipv6_address);
+        json_object_object_add(result_obj, "status", json_object_new_string(reachable ? "OK" : "FAIL"));
+        
+        // Add to response array
+        json_object_array_add(response_array, result_obj);
+    }
+    
+    // Generate response string
+    const char *response_str = json_object_to_json_string(response_array);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    
+    // Cleanup
+    json_object_put(response_array);
+    json_object_put(root);
 }
 
 static void get_traffic(char **dump_out, char *sid)
