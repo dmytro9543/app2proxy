@@ -6,7 +6,7 @@ CC = gcc
 all: app2proxy
 
 app2proxy: main.o mongoose.o
-	$(CC) $(CFLAGS) main.o mongoose.o -o app2proxy
+	$(CC) $(CFLAGS) main.o mongoose.o -ljson-c -o app2proxy
 
 main.o: main.c mongoose.h
 	$(CC) $(CFLAGS) -c main.c -o main.o

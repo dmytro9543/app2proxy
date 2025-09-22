@@ -11,6 +11,7 @@
 #include <time.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <json-c/json.h>
 
 #include "mongoose.h"
 
@@ -312,109 +313,120 @@ bool is_ipv6(const char* ip) {
 
 // Handle the /test-proxies endpoint
 void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm) {
-    // Parse JSON body manually (simple approach)
-    char *body = strndup(hm->body.buf, hm->body.len);
-    char *proxies_start = strstr(body, "\"proxies\":");
-    char *type_start = strstr(body, "\"type\":");
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
     
-    if (!proxies_start || !type_start) {
-        mg_http_reply(c, 400, "", "{\"error\":\"Invalid input\"}");
-        free(body);
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    // Parse JSON using json-c
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
         return;
     }
     
     // Extract type
-    char *type_value = strtok(type_start + 7, "\",}");
-    char type[20];
-    if (type_value) {
-        strncpy(type, type_value, sizeof(type) - 1);
-        type[sizeof(type) - 1] = '\0';
-    } else {
-        mg_http_reply(c, 400, "", "{\"error\":\"Invalid type\"}");
-        free(body);
+    json_object *type_obj;
+    if (!json_object_object_get_ex(root, "type", &type_obj) || 
+        !json_object_is_type(type_obj, json_type_string)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing type\"}");
         return;
     }
+    
+    const char *type = json_object_get_string(type_obj);
     
     // Check if type is valid
     if (strcmp(type, "http-ipv6") != 0 && 
         strcmp(type, "socks5-ipv6") != 0 && 
         strcmp(type, "socks5-ipv4") != 0 && 
         strcmp(type, "any") != 0) {
-        mg_http_reply(c, 400, "", "{\"error\":\"Invalid proxy type\"}");
-        free(body);
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid proxy type\"}");
         return;
     }
     
     // Extract proxies array
-    char *response = malloc(4096);
-    if (!response) {
-        mg_http_reply(c, 500, "", "{\"error\":\"Memory allocation failed\"}");
-        free(body);
+    json_object *proxies_obj;
+    if (!json_object_object_get_ex(root, "proxies", &proxies_obj) || 
+        !json_object_is_type(proxies_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing proxies array\"}");
         return;
     }
     
-    strcpy(response, "{");
+    // Create response object
+    json_object *response_obj = json_object_new_object();
     
-    char *proxy_start = strstr(proxies_start, "[");
-    if (proxy_start) {
-        char *token = strtok(proxy_start + 1, "\",]");
-        while (token) {
-            if (strlen(token) > 3) { // Minimum valid proxy length
-                char *result;
-                
-                if (strcmp(type, "any") == 0) {
-                    result = test_all_proxies(token);
+    // Process each proxy
+    int array_len = json_object_array_length(proxies_obj);
+    for (int i = 0; i < array_len; i++) {
+        json_object *proxy_item = json_object_array_get_idx(proxies_obj, i);
+        
+        if (!json_object_is_type(proxy_item, json_type_string)) {
+            continue; // Skip non-string items
+        }
+        
+        const char *proxy = json_object_get_string(proxy_item);
+        if (strlen(proxy) < 4) { // Minimum valid proxy length
+            json_object_object_add(response_obj, proxy, json_object_new_string("invalid"));
+            continue;
+        }
+        
+        char *result = NULL;
+        
+        if (strcmp(type, "any") == 0) {
+            result = test_all_proxies(proxy);
+        } else {
+            char *ip_result = test_proxy(proxy, type);
+            if (ip_result) {
+                // Determine protocol based on IP type
+                const char *protocol;
+                if (strcmp(type, "http-ipv6") == 0) {
+                    protocol = "http-ipv6";
+                } else if (is_ipv4(ip_result)) {
+                    protocol = "socks5-ipv4";
+                } else if (is_ipv6(ip_result)) {
+                    protocol = "socks5-ipv6";
                 } else {
-                    char *ip_result = test_proxy(token, type);
-                    if (ip_result) {
-                        // Determine protocol based on IP type
-                        const char *protocol;
-                        if (strcmp(type, "http-ipv6") == 0) {
-                            protocol = "http-ipv6";
-                        } else if (is_ipv4(ip_result)) {
-                            protocol = "socks5-ipv4";
-                        } else if (is_ipv6(ip_result)) {
-                            protocol = "socks5-ipv6";
-                        } else {
-                            protocol = "unknown";
-                        }
-                        
-                        result = malloc(strlen(ip_result) + strlen(protocol) + 4);
-                        if (result) {
-                            sprintf(result, "%s (%s)", ip_result, protocol);
-                        }
-                        free(ip_result);
-                    } else {
-                        result = NULL;
-                    }
+                    protocol = "unknown";
                 }
                 
-                // Add to response
-                if (strlen(response) > 1) strcat(response, ",");
-                strcat(response, "\"");
-                strcat(response, token);
-                strcat(response, "\":");
-                
+                result = malloc(strlen(ip_result) + strlen(protocol) + 4);
                 if (result) {
-                    strcat(response, "\"");
-                    strcat(response, result);
-                    strcat(response, "\"");
-                    free(result);
-                } else {
-                    strcat(response, "\"offline\"");
+                    sprintf(result, "%s (%s)", ip_result, protocol);
                 }
+                free(ip_result);
             }
-            
-            token = strtok(NULL, "\",]");
+        }
+        
+        if (result) {
+            json_object_object_add(response_obj, proxy, json_object_new_string(result));
+            free(result);
+        } else {
+            json_object_object_add(response_obj, proxy, json_object_new_string("offline"));
         }
     }
     
-    strcat(response, "}");
+    // Generate response string
+    const char *response_str = json_object_to_json_string(response_obj);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
     
-    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response);
-    
-    free(response);
-    free(body);
+    // Cleanup
+    json_object_put(response_obj);
+    json_object_put(root);
 }
 
 void generate_ipv6_addresses(int count, const char* interface) {
