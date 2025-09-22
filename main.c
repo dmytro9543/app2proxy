@@ -557,32 +557,54 @@ static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message
                   count, interface);
 }
 
-bool ping_ipv6(const char *ipv6_address) {
+static int ping_ipv6_with_result(const char *ipv6_address, char **error_message) {
     char command[256];
-    snprintf(command, sizeof(command), "ping6 -c 1 -W 1 %s 2>&1", ipv6_address);
+    snprintf(command, sizeof(command), "ping6 -c 1 %s 2>&1", ipv6_address);
     
     FILE *fp = popen(command, "r");
     if (fp == NULL) {
-        return false;
+        *error_message = strdup("Failed to execute ping command");
+        return -1;
     }
     
-    // Read the output to check for success
+    // Read the output
     char buffer[128];
-    bool reachable = false;
+    char *output = NULL;
+    size_t output_size = 0;
     
     while (fgets(buffer, sizeof(buffer), fp) != NULL) {
-        // Check for successful ping response
-        if (strstr(buffer, "1 packets transmitted, 1 received") != NULL ||
-            strstr(buffer, "1 packets transmitted, 1 packets received") != NULL) {
-            reachable = true;
-            break;
+        size_t buffer_len = strlen(buffer);
+        char *new_output = realloc(output, output_size + buffer_len + 1);
+        if (!new_output) {
+            free(output);
+            pclose(fp);
+            *error_message = strdup("Memory allocation failed");
+            return -1;
         }
+        output = new_output;
+        memcpy(output + output_size, buffer, buffer_len);
+        output_size += buffer_len;
+        output[output_size] = '\0';
     }
     
-    pclose(fp);
-    return reachable;
+    int status = pclose(fp);
+    
+    if (status != 0) {
+        // Command failed, set error message
+        if (output) {
+            *error_message = output;
+        } else {
+            *error_message = strdup("Unknown error");
+        }
+        return status;
+    } else {
+        free(output);
+        *error_message = NULL;
+        return 0;
+    }
 }
 
+// HTTP handler for IPv6 ping test
 static void handle_ipv6_ping_test(struct mg_connection *c, struct mg_http_message *hm) {
     // Parse JSON body using json-c
     char *body_str = malloc(hm->body.len + 1);
@@ -605,12 +627,20 @@ static void handle_ipv6_ping_test(struct mg_connection *c, struct mg_http_messag
     }
     
     // Extract IPv6 addresses array
-    json_object *ipv6_array_obj;
-    if (!json_object_object_get_ex(root, "ipv6_address", &ipv6_array_obj) || 
-        !json_object_is_type(ipv6_array_obj, json_type_array)) {
+    json_object *ipv6_addresses_obj;
+    if (!json_object_object_get_ex(root, "ipv6_addresses", &ipv6_addresses_obj) || 
+        !json_object_is_type(ipv6_addresses_obj, json_type_array)) {
         json_object_put(root);
         mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
-                      "{\"error\":\"Invalid or missing ipv6_address array\"}");
+                      "{\"error\":\"Invalid or missing ipv6_addresses array\"}");
+        return;
+    }
+    
+    // Check if array is empty
+    if (json_object_array_length(ipv6_addresses_obj) == 0) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"No IPv6 addresses provided\"}");
         return;
     }
     
@@ -618,9 +648,9 @@ static void handle_ipv6_ping_test(struct mg_connection *c, struct mg_http_messag
     json_object *response_array = json_object_new_array();
     
     // Process each IPv6 address
-    int array_len = json_object_array_length(ipv6_array_obj);
+    int array_len = json_object_array_length(ipv6_addresses_obj);
     for (int i = 0; i < array_len; i++) {
-        json_object *ipv6_item = json_object_array_get_idx(ipv6_array_obj, i);
+        json_object *ipv6_item = json_object_array_get_idx(ipv6_addresses_obj, i);
         
         if (!json_object_is_type(ipv6_item, json_type_string)) {
             continue; // Skip non-string items
@@ -630,13 +660,21 @@ static void handle_ipv6_ping_test(struct mg_connection *c, struct mg_http_messag
         
         // Create result object for this IP
         json_object *result_obj = json_object_new_object();
-        
-        // Add the IP address to the result
         json_object_object_add(result_obj, "ipv6", json_object_new_string(ipv6_address));
         
-        // Ping the IPv6 address and add status
-        bool reachable = ping_ipv6(ipv6_address);
-        json_object_object_add(result_obj, "status", json_object_new_string(reachable ? "OK" : "FAIL"));
+        // Ping the IPv6 address
+        char *error_message = NULL;
+        int status = ping_ipv6_with_result(ipv6_address, &error_message);
+        
+        if (status == 0) {
+            json_object_object_add(result_obj, "status", json_object_new_string("OK"));
+        } else {
+            json_object_object_add(result_obj, "status", json_object_new_string("OFF"));
+            if (error_message) {
+                json_object_object_add(result_obj, "error", json_object_new_string(error_message));
+                free(error_message);
+            }
+        }
         
         // Add to response array
         json_object_array_add(response_array, result_obj);
