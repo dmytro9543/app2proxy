@@ -559,7 +559,7 @@ static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message
 
 static int ping_ipv6_with_result(const char *ipv6_address, char **error_message) {
     char command[256];
-    snprintf(command, sizeof(command), "ping6 -c 1 %s 2>&1", ipv6_address);
+    snprintf(command, sizeof(command), "ping6 -c 1 -W 1 %s 2>&1", ipv6_address);
     
     FILE *fp = popen(command, "r");
     if (fp == NULL) {
@@ -776,6 +776,170 @@ static void get_ping(char **dump_out, char *clientip, int count)
 
 }
 
+// Helper function to ping an IPv4 address and return the result
+static int ping_ipv4_with_result(const char *ipv4_address, char **error_message) {
+    char command[256];
+    snprintf(command, sizeof(command), "ping -c 1 -W 1 %s 2>&1", ipv4_address);
+    
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        *error_message = strdup("Failed to execute ping command");
+        return -1;
+    }
+    
+    // Read the output
+    char buffer[128];
+    char *output = NULL;
+    size_t output_size = 0;
+    
+    while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+        size_t buffer_len = strlen(buffer);
+        char *new_output = realloc(output, output_size + buffer_len + 1);
+        if (!new_output) {
+            free(output);
+            pclose(fp);
+            *error_message = strdup("Memory allocation failed");
+            return -1;
+        }
+        output = new_output;
+        memcpy(output + output_size, buffer, buffer_len);
+        output_size += buffer_len;
+        output[output_size] = '\0';
+    }
+    
+    int status = pclose(fp);
+    
+    if (status != 0) {
+        // Command failed, set error message
+        if (output) {
+            *error_message = output;
+        } else {
+            *error_message = strdup("Unknown error");
+        }
+        return status;
+    } else {
+        free(output);
+        *error_message = NULL;
+        return 0;
+    }
+}
+
+// Simple IPv4 validation function
+static bool is_valid_ipv4(const char *ip) {
+    int segments = 0;
+    int digits = 0;
+    int value = 0;
+    
+    for (int i = 0; ip[i] != '\0'; i++) {
+        if (ip[i] == '.') {
+            if (digits == 0 || value > 255) return false;
+            segments++;
+            digits = 0;
+            value = 0;
+        } else if (ip[i] >= '0' && ip[i] <= '9') {
+            if (digits > 0 && value == 0) return false; // Leading zero
+            value = value * 10 + (ip[i] - '0');
+            digits++;
+            if (digits > 3 || value > 255) return false;
+        } else {
+            return false; // Invalid character
+        }
+    }
+    
+    return (segments == 3 && digits > 0 && value <= 255);
+}
+
+// HTTP handler for IPv4 ping test
+static void handle_ipv4_ping_test(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body using json-c
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract IPv4 addresses array
+    json_object *ipv4_addresses_obj;
+    if (!json_object_object_get_ex(root, "ipv4_addresses", &ipv4_addresses_obj) || 
+        !json_object_is_type(ipv4_addresses_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing ipv4_addresses array\"}");
+        return;
+    }
+    
+    // Check if array is empty
+    if (json_object_array_length(ipv4_addresses_obj) == 0) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"No IPv4 addresses provided\"}");
+        return;
+    }
+    
+    // Create response array
+    json_object *response_array = json_object_new_array();
+    
+    // Process each IPv4 address
+    int array_len = json_object_array_length(ipv4_addresses_obj);
+    for (int i = 0; i < array_len; i++) {
+        json_object *ipv4_item = json_object_array_get_idx(ipv4_addresses_obj, i);
+        
+        if (!json_object_is_type(ipv4_item, json_type_string)) {
+            continue; // Skip non-string items
+        }
+        
+        const char *ipv4_address = json_object_get_string(ipv4_item);
+        
+        // Create result object for this IP
+        json_object *result_obj = json_object_new_object();
+        json_object_object_add(result_obj, "ipv4", json_object_new_string(ipv4_address));
+        
+        // Validate IPv4 format before pinging
+        if (!is_valid_ipv4(ipv4_address)) {
+            json_object_object_add(result_obj, "status", json_object_new_string("INVALID"));
+            json_object_object_add(result_obj, "error", json_object_new_string("Invalid IPv4 format"));
+        } else {
+            // Ping the IPv4 address
+            char *error_message = NULL;
+            int status = ping_ipv4_with_result(ipv4_address, &error_message);
+            
+            if (status == 0) {
+                json_object_object_add(result_obj, "status", json_object_new_string("OK"));
+            } else {
+                json_object_object_add(result_obj, "status", json_object_new_string("OFF"));
+                if (error_message) {
+                    json_object_object_add(result_obj, "error", json_object_new_string(error_message));
+                    free(error_message);
+                }
+            }
+        }
+        
+        // Add to response array
+        json_object_array_add(response_array, result_obj);
+    }
+    
+    // Generate response string
+    const char *response_str = json_object_to_json_string(response_array);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    
+    // Cleanup
+    json_object_put(response_array);
+    json_object_put(root);
+}
+
 static void printMg(struct mg_str *mgstr) {
   for(int i=0; i<mgstr->len; i++)
     printf("%c", mgstr->buf[i]);
@@ -886,23 +1050,13 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         handle_generate_ipv6(c, hm);
         return;
       }
-      else if( mg_match(hm->uri, mg_str("/delvlan"), NULL) ) {
-        char vlans[128];
-        if(!strncmp(hm->body.buf, "vlans=", 6)) {
-          int len = hm->body.len - 6;
-          strncpy(vlans, hm->body.buf + 6, len);
-          vlans[ len ] = '\0';
-
-          //del_vlan(vlans);
-
-          mg_http_reply(c, 200, "", "{\"result\":\"%m\"}\n", MG_ESC("success")); 
-        } else {
-          mg_http_reply(c, 500, "", "{\"%m\":\"%m\"}\n", MG_ESC("error"), MG_ESC("Syntax Error")); 
-        }
-      }
       else if (mg_match(hm->uri, mg_str("/ipv6-ping-test"), NULL)) {
         handle_ipv6_ping_test(c, hm);
         return;
+      }
+      if (mg_match(hm->uri, mg_str("/ipv4-ping-test"), NULL)) {
+          handle_ipv4_ping_test(c, hm);
+          return;
       }
       else {
         goto send_errmsg;
