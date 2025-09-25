@@ -487,7 +487,7 @@ void generate_ipv6_addresses(int count, const char *interface) {
     }
     
     // Generate the ipnew.sh file
-    fp = fopen("ipnew.sh", "w");
+    fp = fopen("/root/ipnew.sh", "w");
     if (fp == NULL) {
         perror("Failed to create ipnew.sh");
         return;
