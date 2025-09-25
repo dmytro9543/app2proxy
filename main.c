@@ -517,41 +517,56 @@ void generate_ipv6_addresses(int count, const char* interface) {
 
 // HTTP handler for the IPv6 generation endpoint
 static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm) {
-    // Parse JSON body
-    char *body = strndup(hm->body.buf, hm->body.len);
-    char *count_str = strstr(body, "\"count\":");
-    char *interface_str = strstr(body, "\"interface\":");
+    struct json_tokener *tokener = NULL;
+    struct json_object *parsed_json = NULL;
     
-    int count = 10; // Default value
-    char interface[IFNAMSIZ] = "eth0"; // Default interface
+    int count = 10;
+    char interface[IFNAMSIZ] = "eth0";
     
-    if (count_str) {
-        count = atoi(count_str + 8); // Skip "\"count\":"
-        if (count < 1) count = 1;
-        if (count > 10000) count = 10000;
+    // Initialize JSON parser
+    tokener = json_tokener_new();
+    if (tokener == NULL) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"status\":\"error\", \"message\":\"Failed to initialize JSON parser\"}\n");
+        return;
     }
     
-    if (interface_str) {
-        // Find the value after "interface":"
-        char *start = strchr(interface_str + 12, '"');
-        if (start) {
-            start++;
-            char *end = strchr(start, '"');
-            if (end) {
-                int len = end - start;
-                if (len > IFNAMSIZ - 1) len = IFNAMSIZ - 1;
-                strncpy(interface, start, len);
-                interface[len] = '\0';
-            }
+    // Parse JSON body
+    parsed_json = json_tokener_parse_ex(tokener, hm->body.buf, hm->body.len);
+    
+    if (parsed_json == NULL) {
+        json_tokener_free(tokener);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"status\":\"error\", \"message\":\"Invalid JSON format\"}\n");
+        return;
+    }
+    
+    // Extract values
+    struct json_object *count_obj, *interface_obj;
+    if (json_object_object_get_ex(parsed_json, "quantidade", &count_obj)) {
+        if (json_object_is_type(count_obj, json_type_int)) {
+            count = json_object_get_int(count_obj);
+            if (count < 1) count = 1;
+            if (count > 10000) count = 10000;
         }
     }
     
-    free(body);
+    if (json_object_object_get_ex(parsed_json, "network", &interface_obj)) {
+        if (json_object_is_type(interface_obj, json_type_string)) {
+            const char *interface_str = json_object_get_string(interface_obj);
+            strncpy(interface, interface_str, IFNAMSIZ - 1);
+            interface[IFNAMSIZ - 1] = '\0';
+        }
+    }
     
-    // Generate the IPv6 addresses
+    // Clean up
+    json_object_put(parsed_json);
+    json_tokener_free(tokener);
+    
+    // Generate addresses
     generate_ipv6_addresses(count, interface);
     
-    // Return success response
+    // Return response
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
                   "{\"status\":\"success\", \"message\":\"Generated %d IPv6 addresses for interface %s\"}\n", 
                   count, interface);
@@ -1131,7 +1146,7 @@ int main(int argc, char* argv[])
  
   struct mg_mgr mgr;  // Declare event manager
   mg_mgr_init(&mgr);  // Initialise event manager
-  mg_http_listen(&mgr, "http://0.0.0.0:8080", api_ev_handler, NULL);  // Setup listener
+  mg_http_listen(&mgr, "http://0.0.0.0:8001", api_ev_handler, NULL);  // Setup listener
   for (;;) {          // Run an infinite event loop
     mg_mgr_poll(&mgr, 1000);
   }
