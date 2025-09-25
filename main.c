@@ -429,90 +429,84 @@ void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm) {
     json_object_put(root);
 }
 
-void generate_ipv6_addresses(int count, const char* interface) {
-    char ip6_prefix[INET6_ADDRSTRLEN] = {0};
+void generate_ipv6_suffix(char *suffix) {
+    const char *hex_chars = "0123456789abcdef";
+    char segment[5];
+    
+    suffix[0] = '\0';
+    
+    for (int i = 0; i < 4; i++) {
+        snprintf(segment, sizeof(segment), "%c%c%c%c",
+                hex_chars[rand() % 16],
+                hex_chars[rand() % 16],
+                hex_chars[rand() % 16],
+                hex_chars[rand() % 16]);
+        
+        if (i > 0) {
+            strcat(suffix, ":");
+        }
+        strcat(suffix, segment);
+    }
+}
+
+void generate_ipv6_addresses(int count, const char *interface) {
     FILE *fp;
     char command[256];
+    char ip6_prefix[64] = "";
+    char suffix[64];
     
-    // Try to get IPv6 prefix from system
-    fp = popen("ip -6 addr | grep 'inet6 [23]' | head -1", "r");
-    if (fp) {
-        if (fgets(command, sizeof(command), fp)) {
-            // Extract the IP address part
-            char *slash = strchr(command, '/');
-            if (slash) *slash = '\0';
-            
-            // Find the last colon to get the prefix
-            char *last_colon = strrchr(command, ':');
-            if (last_colon) {
-                *last_colon = '\0';
-                strncpy(ip6_prefix, command, INET6_ADDRSTRLEN - 1);
-            }
+    // Seed random number generator
+    srand(time(NULL));
+    
+    // Determine IPv6 prefix
+    // Method 1: Check local IPv6 addresses starting with 2 or 3
+    snprintf(command, sizeof(command), "ip -6 addr 2>/dev/null | grep 'inet6 [23]' | cut -d '/' -f 1 | grep -oE '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}' | cut -f1-4 -d':' | head -1");
+    
+    fp = popen(command, "r");
+    if (fp != NULL) {
+        if (fgets(ip6_prefix, sizeof(ip6_prefix), fp) != NULL) {
+            ip6_prefix[strcspn(ip6_prefix, "\n")] = '\0';
         }
         pclose(fp);
     }
     
-    // If no prefix found from system, try icanhazip.com
+    // Method 2: If no local IPv6 found, try to get public IPv6
     if (strlen(ip6_prefix) == 0) {
-        fp = popen("curl -6 -s icanhazip.com", "r");
-        if (fp) {
-            if (fgets(ip6_prefix, sizeof(ip6_prefix), fp)) {
-                // Remove newline
-                ip6_prefix[strcspn(ip6_prefix, "\n")] = 0;
-                
-                // Extract prefix (first 4 groups)
-                int colons = 0;
-                char *p = ip6_prefix;
-                while (*p && colons < 4) {
-                    if (*p == ':') colons++;
-                    p++;
-                }
-                if (colons == 4) *p = '\0';
+        fp = popen("curl -6 -s icanhazip.com 2>/dev/null | cut -f1-4 -d':'", "r");
+        if (fp != NULL) {
+            if (fgets(ip6_prefix, sizeof(ip6_prefix), fp) != NULL) {
+                ip6_prefix[strcspn(ip6_prefix, "\n")] = '\0';
             }
             pclose(fp);
         }
     }
     
-    // If still no prefix, use a default
+    // Fallback if both methods fail
     if (strlen(ip6_prefix) == 0) {
-        strcpy(ip6_prefix, "2001:db8::");
+        strcpy(ip6_prefix, "2001:db8"); // Default fallback prefix
     }
     
-    // Array of hex digits
-    const char hex_digits[] = "0123456789abcdef";
-    
-    // Create the script file
-    FILE *script = fopen("ipnew.sh", "w");
-    if (!script) {
+    // Generate the ipnew.sh file
+    fp = fopen("ipnew.sh", "w");
+    if (fp == NULL) {
         perror("Failed to create ipnew.sh");
         return;
     }
     
-    fprintf(script, "#!/bin/bash\n");
+    fprintf(fp, "#!/bin/bash\n");
     
-    // Generate the IPv6 addresses
-    srand(time(NULL));
     for (int i = 0; i < count; i++) {
-        // Generate 4 random groups for the interface ID
-        char groups[4][5];
-        for (int j = 0; j < 4; j++) {
-            for (int k = 0; k < 4; k++) {
-                groups[j][k] = hex_digits[rand() % 16];
-            }
-            groups[j][4] = '\0';
-        }
-        
-        // Format the full IPv6 address
-        fprintf(script, "ip -6 addr add %s:%s:%s:%s:%s/64 dev %s\n", 
-                ip6_prefix, groups[0], groups[1], groups[2], groups[3], interface);
+        generate_ipv6_suffix(suffix);
+        fprintf(fp, "ip -6 addr add %s:%s/64 dev %s\n", ip6_prefix, suffix, interface);
     }
     
-    fclose(script);
+    fclose(fp);
     
     // Make the script executable
     chmod("ipnew.sh", 0755);
     
     printf("Generated %d IPv6 addresses for interface %s\n", count, interface);
+    printf("Script saved as ipnew.sh\n");
 }
 
 // HTTP handler for the IPv6 generation endpoint
