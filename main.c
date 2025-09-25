@@ -52,11 +52,11 @@ static void sig_usr_un(int signo)
     return;
   }
 
-  printf("bng_prometheus_export: Signal %d received.\n", signo);
+  printf("app2proxy: Signal %d received.\n", signo);
     
   if (!main_pid || (main_pid == getpid())) {
     if (pid_file) unlink(pid_file);
-    printf("bng_prometheus_export: Finished.\n");
+    printf("app2proxy: Finished.\n");
     exit(0);
   }
 
