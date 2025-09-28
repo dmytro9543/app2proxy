@@ -24,6 +24,7 @@
 #define CURL_TIMEOUT 2
 #define DEFAULT_COUNT 3
 #define MAX_IP_LENGTH 16  // "xxx.xxx.xxx.xxx" + null terminator
+#define MAX_CONFIG_SIZE 655360  // Maximum config file size
 
 int main_pid = 0;
 int no_fork = 0;
@@ -45,6 +46,7 @@ bool is_ipv6(const char* ip);
 void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm);
 void generate_ipv6_addresses(int count, const char* interface);
 static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm);
+static void handle_delete_proxies(struct mg_connection *c, struct mg_http_message *hm);
 
 static void sig_usr_un(int signo)
 {
@@ -949,6 +951,681 @@ static void handle_ipv4_ping_test(struct mg_connection *c, struct mg_http_messag
     json_object_put(root);
 }
 
+// Function to remove IPv6 address from network interface - IMPROVED VERSION
+static int remove_ipv6_address(const char* ipv6_address) {
+    printf("Removing IPv6 address: %s\n", ipv6_address);
+    
+    // First, check if the IPv6 address actually exists
+    char check_cmd[512];
+    snprintf(check_cmd, sizeof(check_cmd), "ip -6 addr show | grep -q \"%s\"", ipv6_address);
+    int exists = system(check_cmd);
+    
+    if (exists != 0) {
+        printf("IPv6 address %s not found, already removed or doesn't exist\n", ipv6_address);
+        return 0; // Consider it successful if it doesn't exist
+    }
+    
+    // Build removal command - improved interface detection
+    char command[512];
+    char interface[64] = "";
+    FILE *fp;
+    
+    // Improved interface detection - look for the line containing the IP and extract interface
+    snprintf(check_cmd, sizeof(check_cmd), 
+             "ip -6 addr show | grep -B 10 \"%s\" | grep \"^[0-9]\" | tail -1 | awk '{print $2}' | tr -d ':'", 
+             ipv6_address);
+    
+    fp = popen(check_cmd, "r");
+    if (fp != NULL) {
+        if (fgets(interface, sizeof(interface), fp) != NULL) {
+            // Remove newline and any trailing whitespace
+            interface[strcspn(interface, "\n\r\t ")] = '\0';
+            
+            // Validate interface name (basic check)
+            if (strlen(interface) > 0 && strlen(interface) < sizeof(interface) - 1 && 
+                !strchr(interface, ' ') && !strchr(interface, ':')) {
+                printf("Detected interface: %s\n", interface);
+            } else {
+                printf("Invalid interface detected: '%s'\n", interface);
+                interface[0] = '\0'; // Clear invalid interface
+            }
+        }
+        pclose(fp);
+    }
+    
+    int result = -1;
+    
+    // Try removal with detected interface if valid
+    if (strlen(interface) > 0) {
+        snprintf(command, sizeof(command), "ip -6 addr del %s/64 dev %s", ipv6_address, interface);
+        printf("Executing: %s\n", command);
+        result = system(command);
+        
+        if (result == 0) {
+            printf("Successfully removed IPv6 address %s from interface %s\n", ipv6_address, interface);
+            
+            // Verify removal
+            snprintf(check_cmd, sizeof(check_cmd), "ip -6 addr show dev %s | grep -q \"%s\"", interface, ipv6_address);
+            int still_exists = system(check_cmd);
+            if (still_exists != 0) {
+                printf("Verified: IPv6 address %s successfully removed from %s\n", ipv6_address, interface);
+            } else {
+                printf("Warning: IPv6 address %s may still exist on %s\n", ipv6_address, interface);
+            }
+            return result;
+        } else {
+            printf("Failed to remove from detected interface %s, trying alternatives...\n", interface);
+        }
+    }
+    
+    // Alternative: Try to get interface using ip command with exact match
+    if (strlen(interface) == 0) {
+        snprintf(check_cmd, sizeof(check_cmd),
+                 "ip -6 addr show | grep -B 20 \"%s\" | grep -m 1 \"^[0-9][0-9]*:\" | awk '{print $2}' | sed 's/://'",
+                 ipv6_address);
+        
+        fp = popen(check_cmd, "r");
+        if (fp != NULL) {
+            if (fgets(interface, sizeof(interface), fp) != NULL) {
+                interface[strcspn(interface, "\n\r\t ")] = '\0';
+                if (strlen(interface) > 0) {
+                    printf("Alternative detection found interface: %s\n", interface);
+                    
+                    snprintf(command, sizeof(command), "ip -6 addr del %s/64 dev %s", ipv6_address, interface);
+                    printf("Executing: %s\n", command);
+                    result = system(command);
+                    
+                    if (result == 0) {
+                        printf("Successfully removed IPv6 address %s from interface %s\n", ipv6_address, interface);
+                        pclose(fp);
+                        return result;
+                    }
+                }
+            }
+            pclose(fp);
+        }
+    }
+    
+    // If interface detection failed or removal failed, try common interfaces
+    const char *common_interfaces[] = {"eth0", "ens192", "ens33", "ens32", "eno1", "enp0s3", "wlan0", "br0", "bond0", NULL};
+    
+    for (int i = 0; common_interfaces[i] != NULL; i++) {
+        // First check if interface exists and has the IP
+        snprintf(check_cmd, sizeof(check_cmd), 
+                 "ip -6 addr show dev %s 2>/dev/null | grep -q \"%s\"", 
+                 common_interfaces[i], ipv6_address);
+        
+        if (system(check_cmd) == 0) {
+            snprintf(command, sizeof(command), "ip -6 addr del %s/64 dev %s", 
+                     ipv6_address, common_interfaces[i]);
+            printf("Executing: %s\n", command);
+            result = system(command);
+            
+            if (result == 0) {
+                printf("Successfully removed IPv6 address %s from interface %s\n", 
+                       ipv6_address, common_interfaces[i]);
+                return result;
+            }
+        }
+    }
+    
+    // Final fallback - try without specifying interface (let ip command figure it out)
+    snprintf(command, sizeof(command), "ip -6 addr del %s/64 2>/dev/null", ipv6_address);
+    printf("Executing: %s\n", command);
+    result = system(command);
+    
+    if (result == 0) {
+        printf("Successfully removed IPv6 address %s (auto-detected interface)\n", ipv6_address);
+    } else {
+        printf("Error: Failed to remove IPv6 address %s from any interface\n", ipv6_address);
+        printf("You may need to remove it manually using: ip -6 addr del %s/64 dev <interface>\n", ipv6_address);
+    }
+    
+    return result;
+}
+
+// Function to read the entire 3proxy configuration file
+static char* read_3proxy_config() {
+    FILE *file = fopen("/etc/3proxy/3proxy.cfg", "r");
+    if (!file) {
+        return NULL;
+    }
+    
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    if (file_size <= 0 || file_size > MAX_CONFIG_SIZE) {
+        fclose(file);
+        return NULL;
+    }
+    
+    char *content = malloc(file_size + 1);
+    if (!content) {
+        fclose(file);
+        return NULL;
+    }
+    
+    size_t bytes_read = fread(content, 1, file_size, file);
+    content[bytes_read] = '\0';
+    fclose(file);
+    
+    return content;
+}
+
+// Function to write the modified 3proxy configuration file
+static int write_3proxy_config(const char* content) {
+    FILE *file = fopen("/etc/3proxy/3proxy.cfg", "w");
+    if (!file) {
+        return -1;
+    }
+    
+    size_t bytes_written = fwrite(content, 1, strlen(content), file);
+    fclose(file);
+    
+    return (bytes_written == strlen(content)) ? 0 : -1;
+}
+
+// Function to restart 3proxy service
+static int restart_3proxy_service() {
+    int result = system("service 3proxy restart");
+    if (result == 0) {
+        printf("3proxy service restarted successfully\n");
+    } else {
+        printf("Failed to restart 3proxy service\n");
+    }
+    return result;
+}
+
+// Function to extract IPv6 address from proxy configuration block - SIMPLE STRING VERSION
+static char* extract_ipv6_address(const char* block) {
+    printf("Searching for IPv6 in block:\n%s\n", block);
+    
+    // Look for lines containing "socks" or "proxy" commands
+    const char *line_start = block;
+    while (*line_start) {
+        // Find next line
+        const char *line_end = strchr(line_start, '\n');
+        if (!line_end) line_end = line_start + strlen(line_start);
+        
+        // Extract line
+        int line_len = line_end - line_start;
+        char line[256];
+        if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
+        strncpy(line, line_start, line_len);
+        line[line_len] = '\0';
+        
+        // Check if this is a socks or proxy line
+        if (strstr(line, "socks") || strstr(line, "proxy")) {
+            printf("Found proxy line: %s\n", line);
+            
+            // Look for -e parameter with IPv6
+            char *e_param = strstr(line, "-e");
+            if (e_param) {
+                e_param += 2; // Skip "-e"
+                // Skip whitespace
+                while (*e_param == ' ' || *e_param == '\t') e_param++;
+                
+                // Extract the IPv6 address
+                char *ipv6_end = e_param;
+                while (*ipv6_end && (*ipv6_end == ':' || 
+                       (*ipv6_end >= '0' && *ipv6_end <= '9') ||
+                       (*ipv6_end >= 'a' && *ipv6_end <= 'f') ||
+                       (*ipv6_end >= 'A' && *ipv6_end <= 'F'))) {
+                    ipv6_end++;
+                }
+                
+                int ipv6_len = ipv6_end - e_param;
+                if (ipv6_len > 0 && strchr(e_param, ':') != NULL) {
+                    char *ipv6_addr = malloc(ipv6_len + 1);
+                    if (ipv6_addr) {
+                        strncpy(ipv6_addr, e_param, ipv6_len);
+                        ipv6_addr[ipv6_len] = '\0';
+                        printf("SUCCESS: Found IPv6 address: %s\n", ipv6_addr);
+                        return ipv6_addr;
+                    }
+                }
+            }
+            
+            // Also look for -i parameter with IPv6 (in case IPv6 is in -i)
+            char *i_param = strstr(line, "-i");
+            if (i_param) {
+                i_param += 2; // Skip "-i"
+                // Skip whitespace
+                while (*i_param == ' ' || *i_param == '\t') i_param++;
+                
+                // Extract the IPv6 address
+                char *ipv6_end = i_param;
+                while (*ipv6_end && (*ipv6_end == ':' || 
+                       (*ipv6_end >= '0' && *ipv6_end <= '9') ||
+                       (*ipv6_end >= 'a' && *ipv6_end <= 'f') ||
+                       (*ipv6_end >= 'A' && *ipv6_end <= 'F'))) {
+                    ipv6_end++;
+                }
+                
+                int ipv6_len = ipv6_end - i_param;
+                if (ipv6_len > 0 && strchr(i_param, ':') != NULL) {
+                    char *ipv6_addr = malloc(ipv6_len + 1);
+                    if (ipv6_addr) {
+                        strncpy(ipv6_addr, i_param, ipv6_len);
+                        ipv6_addr[ipv6_len] = '\0';
+                        printf("SUCCESS: Found IPv6 address: %s\n", ipv6_addr);
+                        return ipv6_addr;
+                    }
+                }
+            }
+        }
+        
+        // Move to next line
+        if (*line_end == '\n') {
+            line_start = line_end + 1;
+        } else {
+            break;
+        }
+    }
+    
+    printf("No IPv6 address found in block\n");
+    return NULL;
+}
+
+// Function to delete proxies from 3proxy configuration - FIXED VERSION
+static int delete_proxies_from_config(const char** usernames, int count, char** removed_ipv6_addresses, int* ipv6_count) {
+    printf("Starting delete_proxies_from_config\n");
+    
+    // Read the config file
+    FILE *file = fopen("/etc/3proxy/3proxy.cfg", "r");
+    if (!file) {
+        printf("Failed to open config file\n");
+        return -1;
+    }
+    
+    // Create temporary file for new config
+    FILE *temp_file = fopen("/etc/3proxy/3proxy.cfg.tmp", "w");
+    if (!temp_file) {
+        fclose(file);
+        printf("Failed to create temp file\n");
+        return -1;
+    }
+    
+    *ipv6_count = 0;
+    char line[4096];
+    int in_proxy_block = 0;
+    int skip_block = 0;
+    char current_user[128] = "";
+    char block_buffer[8192] = ""; // Increased buffer size
+    size_t block_pos = 0;
+    int found_auth_in_block = 0;
+    
+    // Read file line by line
+    while (fgets(line, sizeof(line), file)) {
+        // Remove newline
+        line[strcspn(line, "\n")] = 0;
+        
+        // Check for proxy block header (comment lines starting with ####)
+        if (strstr(line, "####") != NULL && !in_proxy_block) {
+            // This might be the start of a proxy block
+            in_proxy_block = 1;
+            skip_block = 0;
+            current_user[0] = '\0';
+            block_buffer[0] = '\0';
+            block_pos = 0;
+            found_auth_in_block = 0;
+            
+            // Add this line to block buffer
+            size_t len = strlen(line);
+            if (block_pos + len + 2 < sizeof(block_buffer)) {
+                memcpy(block_buffer + block_pos, line, len);
+                block_pos += len;
+                block_buffer[block_pos++] = '\n';
+            }
+            continue;
+        }
+        
+        // Check if we're starting a proxy block with auth strong
+        if (strstr(line, "auth strong") != NULL) {
+            // If we're already in a block (from a comment header), just mark that we found auth
+            if (in_proxy_block) {
+                found_auth_in_block = 1;
+            } else {
+                // Start new block
+                in_proxy_block = 1;
+                skip_block = 0;
+                current_user[0] = '\0';
+                block_buffer[0] = '\0';
+                block_pos = 0;
+                found_auth_in_block = 1;
+            }
+            
+            // Add this line to block buffer
+            size_t len = strlen(line);
+            if (block_pos + len + 2 < sizeof(block_buffer)) {
+                memcpy(block_buffer + block_pos, line, len);
+                block_pos += len;
+                block_buffer[block_pos++] = '\n';
+            }
+        }
+        // Check for allow line in proxy block
+        else if (in_proxy_block && strstr(line, "allow") != NULL) {
+            // Extract username
+            char *allow_pos = strstr(line, "allow");
+            if (allow_pos) {
+                char *user_start = allow_pos + 5;
+                while (*user_start == ' ' || *user_start == '\t') user_start++;
+                
+                char *user_end = user_start;
+                while (*user_end && *user_end != ' ' && *user_end != '\t' && *user_end != '\n' && *user_end != '\r') {
+                    user_end++;
+                }
+                
+                size_t user_len = user_end - user_start;
+                if (user_len < sizeof(current_user) - 1) {
+                    strncpy(current_user, user_start, user_len);
+                    current_user[user_len] = '\0';
+                    
+                    // Check if this user should be deleted
+                    for (int i = 0; i < count; i++) {
+                        if (strcmp(current_user, usernames[i]) == 0) {
+                            skip_block = 1;
+                            printf("Marking block for user %s to be deleted\n", current_user);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Add line to block buffer
+            size_t len = strlen(line);
+            if (block_pos + len + 2 < sizeof(block_buffer)) {
+                memcpy(block_buffer + block_pos, line, len);
+                block_pos += len;
+                block_buffer[block_pos++] = '\n';
+            }
+        }
+        // Check for flush line (end of proxy block)
+        else if (in_proxy_block && strstr(line, "flush") != NULL) {
+            // Add flush line to block
+            size_t len = strlen(line);
+            if (block_pos + len + 2 < sizeof(block_buffer)) {
+                memcpy(block_buffer + block_pos, line, len);
+                block_pos += len;
+                block_buffer[block_pos++] = '\n';
+            }
+            
+            // NOW extract IPv6 address from the COMPLETE block
+            if (skip_block) {
+                printf("Complete block for user %s:\n%s\n", current_user, block_buffer);
+                char *ipv6_addr = extract_ipv6_address(block_buffer);
+                if (ipv6_addr && *ipv6_count < 10) {
+                    removed_ipv6_addresses[*ipv6_count] = ipv6_addr;
+                    (*ipv6_count)++;
+                    printf("Found IPv6 address to remove: %s\n", ipv6_addr);
+                } else if (ipv6_addr) {
+                    free(ipv6_addr);
+                }
+            }
+            
+            // Write block if not skipped
+            if (!skip_block) {
+                fwrite(block_buffer, 1, block_pos, temp_file);
+            } else {
+                printf("Skipping block for user %s\n", current_user);
+            }
+            
+            in_proxy_block = 0;
+            skip_block = 0;
+            current_user[0] = '\0';
+            block_buffer[0] = '\0';
+            block_pos = 0;
+            found_auth_in_block = 0;
+        }
+        // Handle users line (special case)
+        else if (strstr(line, "users") != NULL && !in_proxy_block) {
+            // Process users line to remove deleted users
+            char new_users_line[8192] = "";
+            char *users_pos = strstr(line, "users");
+            
+            if (users_pos) {
+                strcpy(new_users_line, "users");
+                char *users_list = users_pos + 5;
+                
+                // Skip whitespace
+                while (*users_list == ' ' || *users_list == '\t') users_list++;
+                
+                // Parse each user entry
+                char *current = users_list;
+                int first_user = 1;
+                int users_removed = 0;
+                
+                while (*current) {
+                    char *user_end = current;
+                    while (*user_end && *user_end != ' ' && *user_end != '\t') user_end++;
+                    
+                    if (user_end > current) {
+                        char user_entry[256];
+                        size_t entry_len = user_end - current;
+                        strncpy(user_entry, current, entry_len);
+                        user_entry[entry_len] = '\0';
+                        
+                        // Extract username
+                        char username[128];
+                        strncpy(username, user_entry, sizeof(username) - 1);
+                        username[sizeof(username) - 1] = '\0';
+                        
+                        char *colon_pos = strchr(username, ':');
+                        if (colon_pos) *colon_pos = '\0';
+                        
+                        // Check if user should be kept
+                        int keep_user = 1;
+                        for (int i = 0; i < count; i++) {
+                            if (strcmp(username, usernames[i]) == 0) {
+                                keep_user = 0;
+                                users_removed++;
+                                printf("Removing user from users line: %s\n", username);
+                                break;
+                            }
+                        }
+                        
+                        if (keep_user) {
+                            //if (!first_user) strcat(new_users_line, " ");
+                            strcat(new_users_line, " ");
+                            strcat(new_users_line, user_entry);
+                            first_user = 0;
+                        }
+                    }
+                    
+                    current = user_end;
+                    while (*current == ' ' || *current == '\t') current++;
+                }
+                
+                printf("Processed users line: %d users removed\n", users_removed);
+                fprintf(temp_file, "%s\n", new_users_line);
+            } else {
+                fprintf(temp_file, "%s\n", line);
+            }
+        }
+        // Regular line (not in proxy block)
+        else if (!in_proxy_block) {
+            fprintf(temp_file, "%s\n", line);
+        }
+        // Line inside proxy block (including comment headers, auth, proxy/socks commands, etc.)
+        else if (in_proxy_block) {
+            // Add line to block buffer
+            size_t len = strlen(line);
+            if (block_pos + len + 2 < sizeof(block_buffer)) {
+                memcpy(block_buffer + block_pos, line, len);
+                block_pos += len;
+                block_buffer[block_pos++] = '\n';
+            }
+        }
+    }
+    
+    // Handle any remaining block at end of file
+    if (in_proxy_block && !skip_block && block_pos > 0) {
+        fwrite(block_buffer, 1, block_pos, temp_file);
+    } else if (in_proxy_block && skip_block) {
+        printf("Skipping remaining block for user %s\n", current_user);
+        // Extract IPv6 from remaining block
+        char *ipv6_addr = extract_ipv6_address(block_buffer);
+        if (ipv6_addr && *ipv6_count < 10) {
+            removed_ipv6_addresses[*ipv6_count] = ipv6_addr;
+            (*ipv6_count)++;
+            printf("Found IPv6 address to remove: %s\n", ipv6_addr);
+        } else if (ipv6_addr) {
+            free(ipv6_addr);
+        }
+    }
+    
+    fclose(file);
+    fclose(temp_file);
+    
+    // Replace original file with temp file
+    if (rename("/etc/3proxy/3proxy.cfg.tmp", "/etc/3proxy/3proxy.cfg") != 0) {
+        printf("Failed to replace config file\n");
+        remove("/etc/3proxy/3proxy.cfg.tmp");
+        return -1;
+    }
+    
+    printf("Successfully updated config file. Removed %d IPv6 addresses.\n", *ipv6_count);
+    return 0;
+}
+// HTTP handler for deleting proxies
+static void handle_delete_proxies(struct mg_connection *c, struct mg_http_message *hm) {
+    printf("=== Starting delete_proxies handler ===\n");
+    
+    // Validate input size first
+    if (hm->body.len > 1024 || hm->body.len == 0) {
+        printf("Request too large or empty: %zu bytes\n", hm->body.len);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid request size\"}");
+        return;
+    }
+    
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        printf("Memory allocation failed for body\n");
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    printf("Received JSON: %s\n", body_str);
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        printf("Invalid JSON received\n");
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract usernames array
+    if (!json_object_is_type(root, json_type_array)) {
+        printf("Expected array but got different type\n");
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Expected JSON array of usernames\"}");
+        return;
+    }
+    
+    int array_len = json_object_array_length(root);
+    printf("Number of users to delete: %d\n", array_len);
+    
+    if (array_len == 0) {
+        printf("Empty array received\n");
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"No usernames provided\"}");
+        return;
+    }
+    
+    // Extract usernames
+    const char **usernames = malloc(array_len * sizeof(char*));
+    if (!usernames) {
+        printf("Memory allocation failed for usernames array\n");
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    for (int i = 0; i < array_len; i++) {
+        json_object *user_item = json_object_array_get_idx(root, i);
+        if (json_object_is_type(user_item, json_type_string)) {
+            usernames[i] = json_object_get_string(user_item);
+            printf("User to delete[%d]: %s\n", i, usernames[i]);
+        } else {
+            usernames[i] = "";
+            printf("Warning: non-string item at index %d\n", i);
+        }
+    }
+    
+    // Delete proxies from configuration
+    char *removed_ipv6_addresses[10] = {NULL};
+    int ipv6_count = 0;
+    
+    printf("Calling delete_proxies_from_config...\n");
+    int delete_result = delete_proxies_from_config(usernames, array_len, removed_ipv6_addresses, &ipv6_count);
+    printf("delete_proxies_from_config returned: %d\n", delete_result);
+    
+    if (delete_result == 0) {
+        printf("Config update successful, restarting service...\n");
+        
+        // Restart 3proxy service
+        int restart_result = restart_3proxy_service();
+        printf("Service restart result: %d\n", restart_result);
+        
+        // Remove IPv6 addresses
+        printf("Removing %d IPv6 addresses\n", ipv6_count);
+        for (int i = 0; i < ipv6_count; i++) {
+            if (removed_ipv6_addresses[i]) {
+                printf("Removing IPv6: %s\n", removed_ipv6_addresses[i]);
+                remove_ipv6_address(removed_ipv6_addresses[i]);
+                free(removed_ipv6_addresses[i]);
+            }
+        }
+        
+        // Create success response
+        json_object *response_obj = json_object_new_object();
+        json_object_object_add(response_obj, "status", json_object_new_string("success"));
+        json_object_object_add(response_obj, "message", json_object_new_string("Proxies deleted successfully"));
+        
+        json_object *deleted_users = json_object_new_array();
+        for (int i = 0; i < array_len; i++) {
+            json_object_array_add(deleted_users, json_object_new_string(usernames[i]));
+        }
+        json_object_object_add(response_obj, "deleted_users", deleted_users);
+        
+        if (ipv6_count > 0) {
+            json_object *removed_ips = json_object_new_array();
+            for (int i = 0; i < ipv6_count; i++) {
+                if (removed_ipv6_addresses[i]) {
+                    json_object_array_add(removed_ips, json_object_new_string(removed_ipv6_addresses[i]));
+                }
+            }
+            json_object_object_add(response_obj, "removed_ipv6_addresses", removed_ips);
+        }
+        
+        const char *response_str = json_object_to_json_string(response_obj);
+        mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+        
+        json_object_put(response_obj);
+        printf("Delete operation completed successfully\n");
+    } else {
+        printf("Config update failed\n");
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to delete proxies from configuration\"}");
+    }
+    
+    free(usernames);
+    json_object_put(root);
+    printf("=== Delete proxies handler finished ===\n");
+}
+
 static void printMg(struct mg_str *mgstr) {
   for(int i=0; i<mgstr->len; i++)
     printf("%c", mgstr->buf[i]);
@@ -1066,6 +1743,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       if (mg_match(hm->uri, mg_str("/ipv4-ping-test"), NULL)) {
           handle_ipv4_ping_test(c, hm);
           return;
+      }
+      else if (mg_match(hm->uri, mg_str("/delete-proxies"), NULL)) {
+        handle_delete_proxies(c, hm);
+        return;
       }
       else {
         goto send_errmsg;
