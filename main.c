@@ -1248,11 +1248,11 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
     }
     
     *ipv6_count = 0;
-    char line[4096];
+    char line[40960];
     int in_proxy_block = 0;
     int skip_block = 0;
     char current_user[128] = "";
-    char block_buffer[8192] = ""; // Increased buffer size
+    char block_buffer[81920] = ""; // Increased buffer size
     size_t block_pos = 0;
     int found_auth_in_block = 0;
     
@@ -1381,7 +1381,7 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
         // Handle users line (special case)
         else if (strstr(line, "users") != NULL && !in_proxy_block) {
             // Process users line to remove deleted users
-            char new_users_line[8192] = "";
+            char new_users_line[81920] = "";
             char *users_pos = strstr(line, "users");
             
             if (users_pos) {
