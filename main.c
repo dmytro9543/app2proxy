@@ -1704,7 +1704,7 @@ static char* read_3proxy_config() {
 
 // Function to write 3proxy configuration
 static int write_3proxy_config(const char *content) {
-    printf("Writing 3proxy config...");
+    printf("Writing 3proxy config...\n");
     char backup_cmd[256];
     snprintf(backup_cmd, sizeof(backup_cmd), "cp %s %s.backup", CONFIG_PATH, CONFIG_PATH);
     system(backup_cmd);
@@ -2016,6 +2016,10 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
     
     // Write new configuration
     if (success_count > 0 && write_3proxy_config(new_config)) {
+        
+        int restart_result = restart_3proxy_service();
+        printf("Service restart result: %d\n", restart_result);
+        
         mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
                       "{\"status\":\"success\", \"message\":\"Added %d proxies to configuration\", \"type\":\"%s\"}", 
                       success_count, proxy_type);
