@@ -26,6 +26,8 @@
 #define MAX_IP_LENGTH 16  // "xxx.xxx.xxx.xxx" + null terminator
 #define MAX_CONFIG_SIZE 655360  // Maximum config file size
 
+#define CONFIG_PATH "/etc/3proxy/3proxy.cfg"
+
 int main_pid = 0;
 int no_fork = 0;
 char *pid_file = BNG_EXPORT_PID_FILE;
@@ -1209,48 +1211,6 @@ static char* extract_ipv6_address(const char* block) {
     return NULL;
 }
 
-// Function to read the entire 3proxy configuration file
-static char* read_3proxy_config() {
-    FILE *file = fopen("/etc/3proxy/3proxy.cfg", "r");
-    if (!file) {
-        return NULL;
-    }
-    
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    
-    if (file_size <= 0 || file_size > MAX_CONFIG_SIZE) {
-        fclose(file);
-        return NULL;
-    }
-    
-    char *content = malloc(file_size + 1);
-    if (!content) {
-        fclose(file);
-        return NULL;
-    }
-    
-    size_t bytes_read = fread(content, 1, file_size, file);
-    content[bytes_read] = '\0';
-    fclose(file);
-    
-    return content;
-}
-
-// Function to write the modified 3proxy configuration file
-static int write_3proxy_config(const char* content) {
-    FILE *file = fopen("/etc/3proxy/3proxy.cfg", "w");
-    if (!file) {
-        return -1;
-    }
-    
-    size_t bytes_written = fwrite(content, 1, strlen(content), file);
-    fclose(file);
-    
-    return (bytes_written == strlen(content)) ? 0 : -1;
-}
-
 // Function to restart 3proxy service
 static int restart_3proxy_service() {
     int result = system("service 3proxy restart");
@@ -1267,7 +1227,7 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
     printf("Starting delete_proxies_from_config\n");
     
     // Read the config file
-    FILE *file = fopen("/etc/3proxy/3proxy.cfg", "r");
+    FILE *file = fopen(CONFIG_PATH, "r");
     if (!file) {
         printf("Failed to open config file\n");
         return -1;
@@ -1514,7 +1474,7 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
     fclose(temp_file);
     
     // Replace original file with temp file
-    if (rename("/etc/3proxy/3proxy.cfg.tmp", "/etc/3proxy/3proxy.cfg") != 0) {
+    if (rename("/etc/3proxy/3proxy.cfg.tmp", CONFIG_PATH) != 0) {
         printf("Failed to replace config file\n");
         remove("/etc/3proxy/3proxy.cfg.tmp");
         return -1;
@@ -1705,6 +1665,370 @@ static void handle_delete_proxies(struct mg_connection *c, struct mg_http_messag
     printf("=== Delete proxies handler finished ===\n");
 }
 
+// Function to add IPv6 address to interface
+static int add_ipv6_to_interface(const char *ipv6_address, const char *interface) {
+    char command[256];
+    snprintf(command, sizeof(command), "ip -6 addr add %s/64 dev %s 2>/dev/null", ipv6_address, interface);
+    
+    int result = system(command);
+    printf("IPv6 add result: %d\n", result);
+    return (result == 0);
+}
+
+// Function to read existing 3proxy configuration
+static char* read_3proxy_config() {
+    printf("Config path: %s\n", CONFIG_PATH);
+    
+    FILE *file = fopen(CONFIG_PATH, "r");
+    if (!file) {
+        printf("Failed to open config file: %s\n", strerror(errno));
+        return NULL;
+    }
+    
+    fseek(file, 0, SEEK_END);
+    long length = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    char *content = malloc(length + 1);
+    if (!content) {
+        fclose(file);
+        return NULL;
+    }
+    
+    fread(content, 1, length, file);
+    content[length] = '\0';
+    fclose(file);
+    
+    return content;
+}
+
+// Function to write 3proxy configuration
+static int write_3proxy_config(const char *content) {
+    printf("Writing 3proxy config...");
+    char backup_cmd[256];
+    snprintf(backup_cmd, sizeof(backup_cmd), "cp %s %s.backup", CONFIG_PATH, CONFIG_PATH);
+    system(backup_cmd);
+    
+    FILE *file = fopen(CONFIG_PATH, "w");
+    if (!file) {
+        printf("Failed to open config file for writing: %s\n", strerror(errno));
+        return 0;
+    }
+    
+    fprintf(file, "%s", content);
+    fclose(file);
+    
+    return 1;
+}
+
+// Function to generate proxy configuration block
+static char* generate_proxy_config(const char *proxy_type, const char *host, int port, 
+                                  const char *username, const char *password, 
+                                  const char *external_ip, const char *parent_info) {
+    printf("Generating proxy config...");
+    
+    char *config = malloc(1024);
+    if (!config) return NULL;
+    
+    config[0] = '\0';
+    
+    // Common authentication and access control
+    strcat(config, "auth strong\n");
+    
+    char allow_line[256];
+    snprintf(allow_line, sizeof(allow_line), "allow %s\n", username);
+    strcat(config, allow_line);
+    
+    // Generate specific proxy configuration based on type
+    if (strcmp(proxy_type, "socks-ipv6") == 0) {
+        char proxy_line[256];
+        snprintf(proxy_line, sizeof(proxy_line), "socks -64 -p%d -i%s -e%s\n", 
+                port, host, external_ip);
+        strcat(config, proxy_line);
+        printf("Generated SOCKS5 IPv6 config");
+    }
+    else if (strcmp(proxy_type, "proxy-ipv6") == 0) {
+        char proxy_line[256];
+        snprintf(proxy_line, sizeof(proxy_line), "proxy -64 -p%d -i%s -e%s\n", 
+                port, host, external_ip);
+        strcat(config, proxy_line);
+        printf("Generated HTTP IPv6 config");
+    }
+    else if (strcmp(proxy_type, "proxy-ipv4") == 0) {
+        char proxy_line[256];
+        snprintf(proxy_line, sizeof(proxy_line), "proxy -p%d -i%s -e%s\n", 
+                port, host, external_ip);
+        strcat(config, proxy_line);
+        printf("Generated HTTP IPv4 config");
+    }
+    else if (strcmp(proxy_type, "socks-ipv4") == 0) {
+        char proxy_line[256];
+        snprintf(proxy_line, sizeof(proxy_line), "socks -p%d -i%s -e%s\n", 
+                port, host, external_ip);
+        strcat(config, proxy_line);
+	printf("Generated SOCKS5 IPv4 config");
+    }
+    else if (strcmp(proxy_type, "parent") == 0 && parent_info) {
+        // Parse parent info: "parent_ip parent_port parent_user parent_pass"
+        char parent_ip[64], parent_user[64], parent_pass[64];
+        int parent_port;
+        
+        if (sscanf(parent_info, "%63s %d %63s %63s", parent_ip, &parent_port, parent_user, parent_pass) == 4) {
+            char parent_line[256];
+            snprintf(parent_line, sizeof(parent_line), "parent 1000 socks5 %s %d %s %s\n", 
+                    parent_ip, parent_port, parent_user, parent_pass);
+            strcat(config, parent_line);
+            
+            char socks_line[256];
+            snprintf(socks_line, sizeof(socks_line), "socks -p%d\n", port);
+            strcat(config, socks_line);
+        }
+	printf("Generated Parent config");
+    }
+    
+    strcat(config, "flush\n\n");
+    printf("Generated config:\n%s\n", config);
+    return config;
+}
+
+// Function to add user to 3proxy users line
+static char* update_users_line(const char *current_config, const char *username, const char *password) {
+    printf("Updating users line...");
+    
+    char *users_start = strstr(current_config, "users ");
+    if (!users_start) {
+        printf("Users line not found in config!\n");
+        return NULL;
+    }
+    
+    char *users_end = strchr(users_start, '\n');
+    if (!users_end) {
+        printf("Users line not properly terminated!\n");
+        return NULL;
+    }
+    
+    // Calculate lengths
+    size_t users_line_len = users_end - users_start;
+    size_t new_user_len = strlen(username) + strlen(password) + 5; // " :CL:" + username + password
+    
+    // Create new users line
+    char *new_users_line = malloc(users_line_len + new_user_len + 2);
+    if (!new_users_line) return NULL;
+    
+    // Copy existing users line without the newline
+    strncpy(new_users_line, users_start, users_line_len);
+    new_users_line[users_line_len] = '\0';
+    
+    // Check if user already exists
+    char user_search[128];
+    snprintf(user_search, sizeof(user_search), " %s:", username);
+    if (strstr(new_users_line, user_search) == NULL) {
+        // Add new user
+        strcat(new_users_line, " ");
+        strcat(new_users_line, username);
+        strcat(new_users_line, ":CL:");
+        strcat(new_users_line, password);
+        printf("Added user: %s\n", username);
+    } else {
+        printf("User %s already exists\n", username);
+        free(new_users_line);
+        return NULL;
+    }
+    
+    strcat(new_users_line, "\n");
+    
+    // Replace the users line in the config
+    char *new_config = malloc(strlen(current_config) + new_user_len + 2);
+    if (!new_config) {
+        free(new_users_line);
+        return NULL;
+    }
+    
+    // Copy part before users line
+    strncpy(new_config, current_config, users_start - current_config);
+    new_config[users_start - current_config] = '\0';
+    
+    // Add new users line
+    strcat(new_config, new_users_line);
+    
+    // Copy part after users line
+    strcat(new_config, users_end + 1);
+    
+    free(new_users_line);
+    return new_config;
+}
+
+// HTTP handler for regenerate-proxy endpoint
+static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_message *hm) {
+    printf("Handling regenerate-proxy request");
+    
+    // Parse JSON body using json-c
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    printf("Received JSON: %s\n", body_str);
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract proxies array
+    json_object *proxies_obj;
+    if (!json_object_object_get_ex(root, "proxies", &proxies_obj) || 
+        !json_object_is_type(proxies_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing proxies array\"}");
+        return;
+    }
+    
+    // Extract type array
+    json_object *type_obj;
+    if (!json_object_object_get_ex(root, "Type", &type_obj) || 
+        !json_object_is_type(type_obj, json_type_array) ||
+        json_object_array_length(type_obj) == 0) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing Type array\"}");
+        return;
+    }
+    
+    // Extract interface
+    json_object *interface_obj;
+    const char *interface = "eth0"; // default
+    if (json_object_object_get_ex(root, "interface", &interface_obj) && 
+        json_object_is_type(interface_obj, json_type_string)) {
+        interface = json_object_get_string(interface_obj);
+    }
+    
+    printf("Interface: %s\n", interface);
+    
+    // Read existing configuration
+    char *current_config = read_3proxy_config();
+    if (!current_config) {
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to read current configuration\"}");
+        return;
+    }
+    
+    printf("Current config exists, length: %ld\n", strlen(current_config));
+    
+    // Process each proxy
+    int proxies_len = json_object_array_length(proxies_obj);
+    const char *proxy_type = json_object_get_string(json_object_array_get_idx(type_obj, 0));
+    
+    printf("Processing %d proxies of type: %s\n", proxies_len, proxy_type);
+    
+    char *new_config = strdup(current_config);
+    free(current_config);
+    
+    int success_count = 0;
+    
+    for (int i = 0; i < proxies_len; i++) {
+        json_object *proxy_item = json_object_array_get_idx(proxies_obj, i);
+        
+        if (!json_object_is_type(proxy_item, json_type_string)) {
+            continue;
+        }
+        
+        const char *proxy_str = json_object_get_string(proxy_item);
+        printf("Processing proxy: %s\n", proxy_str);
+        
+        // Parse proxy string: "host:port:username:password external_ip [parent_info]"
+        char host[64], username[64], password[64], external_ip[64], parent_info[256];
+        int port;
+        
+        parent_info[0] = '\0';
+        
+        if (strcmp(proxy_type, "parent") == 0) {
+            // Format: "host:port:username:password parent_ip parent_port parent_user parent_pass"
+            if (sscanf(proxy_str, "%63[^:]:%d:%63[^:]:%63s %63s %63s", 
+                      host, &port, username, password, external_ip, parent_info) >= 5) {
+                printf("Parsed: host=%s, port=%d, user=%s, pass=%s, ip=%s, parent_info=%s\n", 
+                   host, port, username, password, external_ip, parent_info);
+                // Reconstruct parent info
+                char *space_pos = strchr(proxy_str, ' ');
+                if (space_pos) {
+                    strncpy(parent_info, space_pos + 1, sizeof(parent_info) - 1);
+                    parent_info[sizeof(parent_info) - 1] = '\0';
+                }
+            }
+        } else {
+            // Format: "host:port:username:password external_ip"
+            if (sscanf(proxy_str, "%63[^:]:%d:%63[^:]:%63s %63s", 
+                      host, &port, username, password, external_ip) == 5) {
+                printf("Parsed: host=%s, port=%d, user=%s, pass=%s, ip=%s\n", 
+                   host, port, username, password, external_ip);
+            
+                // For IPv6 proxies, add the IPv6 address to the interface
+                if (strstr(proxy_type, "ipv6") != NULL) {
+                    printf("Adding IPv6 address to interface...\n");
+                    if (!add_ipv6_to_interface(external_ip, interface)) {
+                        printf("Warning: Failed to add IPv6 address %s to interface %s\n", 
+                               external_ip, interface);
+                    }
+                }
+            }
+        }
+        
+        // Update users line
+        char *updated_config = update_users_line(new_config, username, password);
+        if (updated_config) {
+            free(new_config);
+            new_config = updated_config;
+            printf("Users line updated successfully\n");
+        } else {
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                      "{\"status\":\"failed\", \"message\":\"User %s already exists\", \"type\":\"%s\"}", 
+                      username, proxy_type);
+            goto exit_regerate;
+        }
+        
+        // Generate proxy configuration
+        char *proxy_config = generate_proxy_config(proxy_type, host, port, username, 
+                                                  password, external_ip, parent_info);
+        if (proxy_config) {
+            // Append to configuration
+            char *combined_config = malloc(strlen(new_config) + strlen(proxy_config) + 1);
+            if (combined_config) {
+                strcpy(combined_config, new_config);
+                strcat(combined_config, proxy_config);
+                free(new_config);
+                new_config = combined_config;
+                success_count++;
+            }
+            free(proxy_config);
+        }
+    }
+    
+    // Write new configuration
+    if (success_count > 0 && write_3proxy_config(new_config)) {
+        mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                      "{\"status\":\"success\", \"message\":\"Added %d proxies to configuration\", \"type\":\"%s\"}", 
+                      success_count, proxy_type);
+    } else {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to update configuration\"}");
+    }
+
+exit_regerate:
+    free(new_config);
+    json_object_put(root);
+}
+
 static void printMg(struct mg_str *mgstr) {
   for(int i=0; i<mgstr->len; i++)
     printf("%c", mgstr->buf[i]);
@@ -1826,6 +2150,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       else if (mg_match(hm->uri, mg_str("/delete-proxies"), NULL)) {
         handle_delete_proxies(c, hm);
         return;
+      }
+      else if (mg_match(hm->uri, mg_str("/regenerate-proxy"), NULL)) {
+          handle_regenerate_proxy(c, hm);
+          return;
       }
       else {
         goto send_errmsg;
