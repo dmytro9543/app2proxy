@@ -1820,7 +1820,7 @@ static char* update_users_line(const char *current_config, const char *username,
     new_users_line[users_line_len] = '\0';
     
     // Check if user already exists
-    char user_search[128];
+    char user_search[99999];
     snprintf(user_search, sizeof(user_search), " %s:", username);
     if (strstr(new_users_line, user_search) == NULL) {
         // Add new user
@@ -1858,9 +1858,132 @@ static char* update_users_line(const char *current_config, const char *username,
     return new_config;
 }
 
-// HTTP handler for regenerate-proxy endpoint
+// Ultra-simple function to delete proxy block by username
+static int delete_proxy_by_username_simple(const char *username) {
+    printf("Deleting proxy for user: %s\n", username);
+    
+    // Read entire config file
+    char *config = read_3proxy_config();
+    if (!config) {
+        printf("Failed to read config file\n");
+        return -1;
+    }
+    
+    char *new_config = malloc(strlen(config) + 1);
+    if (!new_config) {
+        free(config);
+        return -1;
+    }
+    
+    new_config[0] = '\0';
+    
+    char *current = config;
+    int deleted = 0;
+    
+    while (*current) {
+        // Look for proxy blocks
+        if (strncmp(current, "auth strong", 11) == 0) {
+            char *block_start = current;
+            
+            // Find the end of this block (next auth strong or end of file)
+            char *block_end = strstr(current + 11, "auth strong");
+            if (!block_end) {
+                block_end = config + strlen(config);
+            }
+            
+            // Check if this block contains our target username
+            char block_segment[block_end - block_start + 1];
+            strncpy(block_segment, block_start, block_end - block_start);
+            block_segment[block_end - block_start] = '\0';
+            
+            // Look for "allow username" in this block
+            char allow_pattern[99999];
+            snprintf(allow_pattern, sizeof(allow_pattern), "allow %s", username);
+            
+            if (strstr(block_segment, allow_pattern) != NULL) {
+                // Skip this block - don't copy it to new config
+                printf("Skipping block for user %s\n", username);
+                current = block_end;
+                deleted = 1;
+                continue;
+            }
+        }
+        
+        // Handle users line
+        if (strncmp(current, "users", 5) == 0) {
+            char *line_end = strchr(current, '\n');
+            if (!line_end) line_end = config + strlen(config);
+            
+            char users_line[line_end - current + 1];
+            strncpy(users_line, current, line_end - current);
+            users_line[line_end - current] = '\0';
+            
+            if (strstr(users_line, username) != NULL) {
+                // Rebuild users line without the target user
+                printf("Rebuilding users line without %s\n", username);
+                
+                char new_users_line[99999] = "users";
+                char *token;
+                char *rest = users_line + 5; // Skip "users"
+                
+                // Skip initial whitespace
+                while (*rest == ' ' || *rest == '\t') rest++;
+                
+                char *token_rest = rest;
+                while ((token = strtok_r(token_rest, " \t", &token_rest))) {
+                    char user_part[99999];
+                    strncpy(user_part, token, sizeof(user_part) - 1);
+                    user_part[sizeof(user_part) - 1] = '\0';
+                    
+                    char *colon_pos = strchr(user_part, ':');
+                    if (colon_pos) *colon_pos = '\0';
+                    
+                    if (strcmp(user_part, username) != 0) {
+                        strcat(new_users_line, " ");
+                        strcat(new_users_line, token);
+                    }
+                }
+                
+                strcat(new_users_line, "\n");
+                strcat(new_config, new_users_line);
+                current = line_end + 1;
+                continue;
+            }
+        }
+        
+        // Copy character by character
+        strncat(new_config, current, 1);
+        current++;
+    }
+    
+    // Write new config
+    FILE *file = fopen(CONFIG_PATH, "w");
+    if (file) {
+        fwrite(new_config, 1, strlen(new_config), file);
+        fclose(file);
+        printf("Successfully updated config file\n");
+    } else {
+        printf("Failed to write config file\n");
+        free(config);
+        free(new_config);
+        return -1;
+    }
+    
+    free(config);
+    free(new_config);
+    
+    if (deleted) {
+        printf("Successfully deleted proxy for user %s\n", username);
+        return 0;
+    } else {
+        printf("No proxy found for user %s\n", username);
+        return -1;
+    }
+}
+
+// HTTP handler for regenerate-proxy endpoint - UPDATED VERSION
 static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_message *hm) {
-    printf("Handling regenerate-proxy request");
+    printf("Handling regenerate-proxy request with broken proxy detection\n");
     
     // Parse JSON body using json-c
     char *body_str = malloc(hm->body.len + 1);
@@ -1936,11 +2059,20 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
     free(current_config);
     
     int success_count = 0;
+    int broken_fixed_count = 0;
+    int already_configured_count = 0;
+    
+    // Arrays for detailed response
+    json_object *regenerated_users = json_object_new_array();
+    json_object *broken_fixed_users = json_object_new_array();
+    json_object *already_configured_users = json_object_new_array();
+    json_object *failed_users = json_object_new_array();
     
     for (int i = 0; i < proxies_len; i++) {
         json_object *proxy_item = json_object_array_get_idx(proxies_obj, i);
         
         if (!json_object_is_type(proxy_item, json_type_string)) {
+            json_object_array_add(failed_users, json_object_new_string("invalid_format"));
             continue;
         }
         
@@ -1952,13 +2084,17 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         int port;
         
         parent_info[0] = '\0';
+        external_ip[0] = '\0';
+        
+        int parse_success = 0;
         
         if (strcmp(proxy_type, "parent") == 0) {
             // Format: "host:port:username:password parent_ip parent_port parent_user parent_pass"
             if (sscanf(proxy_str, "%63[^:]:%d:%63[^:]:%63s %63s %63s", 
                       host, &port, username, password, external_ip, parent_info) >= 5) {
-                printf("Parsed: host=%s, port=%d, user=%s, pass=%s, ip=%s, parent_info=%s\n", 
-                   host, port, username, password, external_ip, parent_info);
+                parse_success = 1;
+                printf("Parsed: host=%s, port=%d, user=%s, pass=***, ip=%s, parent_info=%s\n", 
+                   host, port, username, external_ip, parent_info);
                 // Reconstruct parent info
                 char *space_pos = strchr(proxy_str, ' ');
                 if (space_pos) {
@@ -1970,17 +2106,54 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
             // Format: "host:port:username:password external_ip"
             if (sscanf(proxy_str, "%63[^:]:%d:%63[^:]:%63s %63s", 
                       host, &port, username, password, external_ip) == 5) {
-                printf("Parsed: host=%s, port=%d, user=%s, pass=%s, ip=%s\n", 
-                   host, port, username, password, external_ip);
+                parse_success = 1;
+                printf("Parsed: host=%s, port=%d, user=%s, pass=***, ip=%s\n", 
+                   host, port, username, external_ip);
+            }
+        }
+        
+        if (!parse_success) {
+            printf("Failed to parse proxy string: %s\n", proxy_str);
+            json_object_array_add(failed_users, json_object_new_string(proxy_str));
+            continue;
+        }
+        
+        // Check if proxy exists but is broken
+        int proxy_exists = 0;
+        char allow_pattern[256];
+        snprintf(allow_pattern, sizeof(allow_pattern), "allow %s", username);
+        if (strstr(new_config, allow_pattern) != NULL) {
+            proxy_exists = 1;
+            printf("Proxy for user %s exists but is broken - deleting and regenerating\n", username);
             
-                // For IPv6 proxies, add the IPv6 address to the interface
-                if (strstr(proxy_type, "ipv6") != NULL) {
-                    printf("Adding IPv6 address to interface...\n");
-                    if (!add_ipv6_to_interface(external_ip, interface)) {
-                        printf("Warning: Failed to add IPv6 address %s to interface %s\n", 
-                               external_ip, interface);
-                    }
+            // Delete the broken proxy
+            if (delete_proxy_by_username_simple(username) == 0) {
+                printf("Successfully deleted broken proxy for user %s\n", username);
+                broken_fixed_count++;
+                json_object_array_add(broken_fixed_users, json_object_new_string(username));
+                
+                // Reload the config after deletion
+                free(new_config);
+                new_config = read_3proxy_config();
+                if (!new_config) {
+                    printf("Failed to reload config after deletion\n");
+                    json_object_array_add(failed_users, json_object_new_string(username));
+                    continue;
                 }
+            } else {
+                printf("Failed to delete broken proxy for user %s\n", username);
+                json_object_array_add(failed_users, json_object_new_string(username));
+                continue;
+            }
+        }
+        
+        // For IPv6 proxies, add the IPv6 address to the interface
+        if (strstr(proxy_type, "ipv6") != NULL && external_ip[0] != '\0') {
+            printf("Adding IPv6 address to interface...\n");
+            if (!add_ipv6_to_interface(external_ip, interface)) {
+                printf("Warning: Failed to add IPv6 address %s to interface %s\n", 
+                       external_ip, interface);
+                // Continue anyway - the IP might already be there
             }
         }
         
@@ -1989,12 +2162,9 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         if (updated_config) {
             free(new_config);
             new_config = updated_config;
-            printf("Users line updated successfully\n");
+            printf("Users line updated successfully for user %s\n", username);
         } else {
-            mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
-                      "{\"status\":\"failed\", \"message\":\"User %s already exists\", \"type\":\"%s\"}", 
-                      username, proxy_type);
-            goto exit_regerate;
+            printf("User %s already exists in users line\n", username);
         }
         
         // Generate proxy configuration
@@ -2009,8 +2179,20 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
                 free(new_config);
                 new_config = combined_config;
                 success_count++;
+                
+                if (!proxy_exists) {
+                    json_object_array_add(regenerated_users, json_object_new_string(username));
+                }
+                
+                printf("Successfully added proxy configuration for user %s\n", username);
+            } else {
+                printf("Failed to combine config for user %s\n", username);
+                json_object_array_add(failed_users, json_object_new_string(username));
             }
             free(proxy_config);
+        } else {
+            printf("Failed to generate proxy config for user %s\n", username);
+            json_object_array_add(failed_users, json_object_new_string(username));
         }
     }
     
@@ -2020,15 +2202,57 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         int restart_result = restart_3proxy_service();
         printf("Service restart result: %d\n", restart_result);
         
-        mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
-                      "{\"status\":\"success\", \"message\":\"Added %d proxies to configuration\", \"type\":\"%s\"}", 
-                      success_count, proxy_type);
+        // Create detailed response
+        json_object *response_obj = json_object_new_object();
+        json_object_object_add(response_obj, "status", json_object_new_string("success"));
+        
+        char message[512];
+        if (broken_fixed_count > 0) {
+            snprintf(message, sizeof(message), 
+                    "Processed %d proxies: %d regenerated, %d failed", 
+                    proxies_len, success_count, 
+                    json_object_array_length(failed_users));
+        } else {
+            snprintf(message, sizeof(message), 
+                    "Processed %d proxies: %d regenerated, %d failed", 
+                    proxies_len, success_count, 
+                    json_object_array_length(failed_users));
+        }
+        
+        json_object_object_add(response_obj, "message", json_object_new_string(message));
+        json_object_object_add(response_obj, "type", json_object_new_string(proxy_type));
+        
+        // Add detailed arrays
+        //json_object_object_add(response_obj, "already_configured", already_configured_users);
+        json_object_object_add(response_obj, "regenerated", regenerated_users);
+        if (broken_fixed_count > 0) {
+            json_object_object_add(response_obj, "broken_fixed", broken_fixed_users);
+        } else {
+            json_object_put(broken_fixed_users);
+        }
+        json_object_object_add(response_obj, "failed", failed_users);
+        
+        const char *response_str = json_object_to_json_string(response_obj);
+        mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+        
+        json_object_put(response_obj);
+        
     } else {
-        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
-                      "{\"error\":\"Failed to update configuration\"}");
+        // Clean up JSON objects on failure
+        json_object_put(already_configured_users);
+        json_object_put(regenerated_users);
+        json_object_put(broken_fixed_users);
+        json_object_put(failed_users);
+        
+        if (success_count == 0) {
+            mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                          "{\"error\":\"Failed to update configuration - no proxies were added\"}");
+        } else {
+            mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                          "{\"error\":\"Failed to write configuration file\"}");
+        }
     }
 
-exit_regerate:
     free(new_config);
     json_object_put(root);
 }
