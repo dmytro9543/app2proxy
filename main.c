@@ -1598,7 +1598,7 @@ static int add_ipv6_to_interface(const char *ipv6_address, const char *interface
     snprintf(command, sizeof(command), "ip -6 addr add %s/64 dev %s 2>/dev/null", ipv6_address, interface);
     
     int result = system(command);
-    printf("IPv6 add result: %d\n", result);
+    printf("IPv6 add result: %s, %d\n", command, result);
     return (result == 0);
 }
 
