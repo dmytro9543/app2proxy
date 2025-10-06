@@ -1595,7 +1595,7 @@ static void handle_delete_proxies(struct mg_connection *c, struct mg_http_messag
 // Function to add IPv6 address to interface
 static int add_ipv6_to_interface(const char *ipv6_address, const char *interface) {
     char command[256];
-    snprintf(command, sizeof(command), "ip -6 addr add %s/64 dev %s 2>/dev/null", ipv6_address, interface);
+    snprintf(command, sizeof(command), "ip -6 addr add %s dev %s 2>/dev/null", ipv6_address, interface);
     
     int result = system(command);
     printf("IPv6 add result: %s, %d\n", command, result);
@@ -1648,6 +1648,36 @@ static int write_3proxy_config(const char *content) {
     return 1;
 }
 
+char* remove_ipv6_prefix(const char* ipv6_input) {
+    if (ipv6_input == NULL) {
+        return NULL;
+    }
+    
+    // Find the last occurrence of '/'
+    char* slash_pos = strrchr(ipv6_input, '/');
+    
+    if (slash_pos == NULL) {
+        // No prefix found, return a copy of the original string
+        return strdup(ipv6_input);
+    }
+    
+    // Calculate the length of the IP address part
+    size_t ip_length = slash_pos - ipv6_input;
+    
+    // Allocate memory for the result
+    char* result = malloc(ip_length + 1);
+    if (result == NULL) {
+        return NULL;
+    }
+    
+    // Copy the IP address part
+    strncpy(result, ipv6_input, ip_length);
+    result[ip_length] = '\0';
+    
+    return result;
+}
+
+
 // Function to generate proxy configuration block
 static char* generate_proxy_config(const char *proxy_type, const char *host, int port, 
                                   const char *username, const char *password, 
@@ -1658,6 +1688,8 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     if (!config) return NULL;
     
     config[0] = '\0';
+
+    char* external_ip_removed_prefix = remove_ipv6_prefix(external_ip);
     
     // Common authentication and access control
     strcat(config, "auth strong\n");
@@ -1670,28 +1702,28 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     if (strcmp(proxy_type, "socks-ipv6") == 0) {
         char proxy_line[256];
         snprintf(proxy_line, sizeof(proxy_line), "socks -64 -p%d -i%s -e%s\n", 
-                port, host, external_ip);
+                port, host, external_ip_removed_prefix);
         strcat(config, proxy_line);
         printf("Generated SOCKS5 IPv6 config");
     }
     else if (strcmp(proxy_type, "proxy-ipv6") == 0) {
         char proxy_line[256];
         snprintf(proxy_line, sizeof(proxy_line), "proxy -64 -p%d -i%s -e%s\n", 
-                port, host, external_ip);
+                port, host, external_ip_removed_prefix);
         strcat(config, proxy_line);
         printf("Generated HTTP IPv6 config");
     }
     else if (strcmp(proxy_type, "proxy-ipv4") == 0) {
         char proxy_line[256];
         snprintf(proxy_line, sizeof(proxy_line), "proxy -p%d -i%s -e%s\n", 
-                port, host, external_ip);
+                port, host, external_ip_removed_prefix);
         strcat(config, proxy_line);
         printf("Generated HTTP IPv4 config");
     }
     else if (strcmp(proxy_type, "socks-ipv4") == 0) {
         char proxy_line[256];
         snprintf(proxy_line, sizeof(proxy_line), "socks -p%d -i%s -e%s\n", 
-                port, host, external_ip);
+                port, host, external_ip_removed_prefix);
         strcat(config, proxy_line);
 	printf("Generated SOCKS5 IPv4 config");
     }
@@ -1715,6 +1747,9 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     
     strcat(config, "flush\n\n");
     printf("Generated config:\n%s\n", config);
+
+    free(external_ip_removed_prefix);
+    
     return config;
 }
 
