@@ -986,8 +986,8 @@ static int remove_ipv6_address(const char* ipv6_address) {
              ipv6_address);
     
     FILE *fp = popen(check_cmd, "r");
+    char exact_ip[128] = "";
     if (fp != NULL) {
-        char exact_ip[128] = "";
         if (fgets(exact_ip, sizeof(exact_ip), fp) != NULL) {
             // Remove newline
             exact_ip[strcspn(exact_ip, "\n")] = '\0';
@@ -1010,7 +1010,7 @@ static int remove_ipv6_address(const char* ipv6_address) {
     // Method 2: Try to find interface and remove
     char interface[64] = "";
     snprintf(check_cmd, sizeof(check_cmd),
-             "ip -6 addr show | grep -B 10 '%s' | grep '^[0-9]' | tail -1 | cut -d: -f2 | sed 's/ //'",
+             "ip -6 addr show | grep -B 10000 '%s' | grep '^[0-9]' | tail -1 | cut -d: -f2 | sed 's/ //'",
              ipv6_address);
     
     fp = popen(check_cmd, "r");
@@ -1024,89 +1024,16 @@ static int remove_ipv6_address(const char* ipv6_address) {
                 const int prefixes[] = {56, 64, 128, 0};
                 for (int i = 0; prefixes[i] != 0; i++) {
                     snprintf(remove_cmd, sizeof(remove_cmd), 
-                             "ip -6 addr del %s/%d dev %s 2>/dev/null", 
-                             ipv6_address, prefixes[i], interface);
+                             "ip -6 addr del %s dev %s 2>/dev/null", 
+                             exact_ip, interface);
                     printf("Trying: %s\n", remove_cmd);
                     result = system(remove_cmd);
                     
                     if (result == 0) {
-                        printf("Successfully removed with prefix /%d from %s\n", prefixes[i], interface);
+                        printf("Successfully removed with prefix %s from %s\n", exact_ip, interface);
                         pclose(fp);
                         return result;
                     }
-                }
-            }
-        }
-        pclose(fp);
-    }
-    
-    // Method 3: Try common interfaces with different prefixes
-    const char *common_interfaces[] = {"ens160", "ens192", "ens33", "eth0", "ens32", "eno1", NULL};
-    const int prefixes[] = {56, 64, 128, 0};
-    
-    for (int i = 0; common_interfaces[i] != NULL; i++) {
-        for (int j = 0; prefixes[j] != 0; j++) {
-            // Check if interface exists and has the IP
-            snprintf(check_cmd, sizeof(check_cmd),
-                     "ip -6 addr show dev %s 2>/dev/null | grep -q '%s'",
-                     common_interfaces[i], ipv6_address);
-            
-            if (system(check_cmd) == 0) {
-                snprintf(remove_cmd, sizeof(remove_cmd),
-                         "ip -6 addr del %s/%d dev %s 2>/dev/null",
-                         ipv6_address, prefixes[j], common_interfaces[i]);
-                printf("Trying: %s\n", remove_cmd);
-                result = system(remove_cmd);
-                
-                if (result == 0) {
-                    printf("Successfully removed from %s with prefix /%d\n", 
-                           common_interfaces[i], prefixes[j]);
-                    return result;
-                }
-            }
-        }
-    }
-    
-    // Method 4: Final attempt - force remove without interface
-    printf("Trying force removal without interface...\n");
-    
-    for (int i = 0; prefixes[i] != 0; i++) {
-        snprintf(remove_cmd, sizeof(remove_cmd),
-                 "ip -6 addr del %s/%d 2>/dev/null",
-                 ipv6_address, prefixes[i]);
-        printf("Trying: %s\n", remove_cmd);
-        result = system(remove_cmd);
-        
-        if (result == 0) {
-            printf("Successfully removed with prefix /%d (auto-interface)\n", prefixes[i]);
-            return result;
-        }
-    }
-    
-    // Method 5: Last resort - use ip route to find and remove
-    printf("Trying route-based detection...\n");
-    snprintf(check_cmd, sizeof(check_cmd),
-             "ip -6 route get %s 2>/dev/null | grep -o 'dev [^ ]*' | cut -d' ' -f2",
-             ipv6_address);
-    
-    fp = popen(check_cmd, "r");
-    if (fp != NULL) {
-        char route_interface[64] = "";
-        if (fgets(route_interface, sizeof(route_interface), fp) != NULL) {
-            route_interface[strcspn(route_interface, "\n")] = '\0';
-            printf("Route detection found interface: %s\n", route_interface);
-            
-            for (int i = 0; prefixes[i] != 0; i++) {
-                snprintf(remove_cmd, sizeof(remove_cmd),
-                         "ip -6 addr del %s/%d dev %s 2>/dev/null",
-                         ipv6_address, prefixes[i], route_interface);
-                printf("Trying: %s\n", remove_cmd);
-                result = system(remove_cmd);
-                
-                if (result == 0) {
-                    printf("Successfully removed via route detection\n");
-                    pclose(fp);
-                    return result;
                 }
             }
         }
