@@ -485,9 +485,9 @@ void generate_ipv6_addresses(int count, const char *interface, char **ipv6list) 
     }
     
     // Fallback if both methods fail
-    if (strlen(ip6_prefix) == 0) {
+    /*if (strlen(ip6_prefix) == 0) {
         strcpy(ip6_prefix, "2001:db8"); // Default fallback prefix
-    }
+    }*/
     
     // Generate the ipnew.sh file
     fp = fopen("/root/ipnew.sh", "w");
