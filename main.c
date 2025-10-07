@@ -2371,6 +2371,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           handle_regenerate_proxy(c, hm);
           return;
       }
+      else if (mg_match(hm->uri, mg_str("/create-proxy"), NULL)) {
+          handle_regenerate_proxy(c, hm);
+          return;
+      }
       else {
         goto send_errmsg;
       }
