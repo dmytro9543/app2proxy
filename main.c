@@ -46,7 +46,6 @@ char* test_all_proxies(const char* proxy);
 bool is_ipv4(const char* ip);
 bool is_ipv6(const char* ip);
 void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm);
-void generate_ipv6_addresses(int count, const char* interface);
 static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_delete_proxies(struct mg_connection *c, struct mg_http_message *hm);
 
@@ -453,7 +452,7 @@ void generate_ipv6_suffix(char *suffix) {
     }
 }
 
-void generate_ipv6_addresses(int count, const char *interface) {
+void generate_ipv6_addresses(int count, const char *interface, char **ipv6list) {
     FILE *fp;
     char command[256];
     char ip6_prefix[64] = "";
@@ -502,6 +501,9 @@ void generate_ipv6_addresses(int count, const char *interface) {
     for (int i = 0; i < count; i++) {
         generate_ipv6_suffix(suffix);
         fprintf(fp, "ip -6 addr add %s:%s/64 dev %s\n", ip6_prefix, suffix, interface);
+        char ipv6addr[132];
+        snprintf(ipv6addr, sizeof(ipv6addr), "%s:%s/64", ip6_prefix, suffix);
+        ipv6list[i] = strdup(ipv6addr);
     }
     
     fclose(fp);
@@ -560,14 +562,38 @@ static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message
     // Clean up
     json_object_put(parsed_json);
     json_tokener_free(tokener);
+
+    char *ipv6list[10000];
     
     // Generate addresses
-    generate_ipv6_addresses(count, interface);
+    generate_ipv6_addresses(count, interface, ipv6list);
+
+    // Create JSON response
+    struct json_object *response = json_object_new_object();
+    json_object_object_add(response, "status", json_object_new_string("success"));
     
-    // Return response
-    mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
-                  "{\"status\":\"success\", \"message\":\"Generated %d IPv6 addresses for interface %s\"}\n", 
-                  count, interface);
+    // Create message using snprintf
+    char message[256];
+    snprintf(message, sizeof(message), "Generated %d IPv6 addresses for interface %s", count, interface);
+    json_object_object_add(response, "message", json_object_new_string(message));
+    
+    // Add IPv6 addresses array
+    struct json_object *ip_array = json_object_new_array();
+    for (int i = 0; i < count; i++) {
+        json_object_array_add(ip_array, json_object_new_string(ipv6list[i]));
+    }
+    json_object_object_add(response, "addresses", ip_array);
+    
+    // Send response
+    const char *json_str = json_object_to_json_string(response);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s\n", json_str);
+    
+    // Cleanup
+    json_object_put(response);
+    for (int i = 0; i < count; i++) {
+        free(ipv6list[i]);
+    }
+    
 }
 
 static int ping_ipv6_with_result(const char *ipv6_address, char **error_message) {
@@ -2171,12 +2197,12 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         char message[512];
         if (broken_fixed_count > 0) {
             snprintf(message, sizeof(message), 
-                    "Processed %d proxies: %d regenerated, %d failed", 
+                    "Processed %d proxies: %ld regenerated, %d failed", 
                     proxies_len, success_count, 
                     json_object_array_length(failed_users));
         } else {
             snprintf(message, sizeof(message), 
-                    "Processed %d proxies: %d regenerated, %d failed", 
+                    "Processed %d proxies: %ld regenerated, %d failed", 
                     proxies_len, success_count, 
                     json_object_array_length(failed_users));
         }
