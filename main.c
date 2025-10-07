@@ -502,7 +502,7 @@ void generate_ipv6_addresses(int count, const char *interface, char **ipv6list) 
         generate_ipv6_suffix(suffix);
         fprintf(fp, "ip -6 addr add %s:%s/64 dev %s\n", ip6_prefix, suffix, interface);
         char ipv6addr[132];
-        snprintf(ipv6addr, sizeof(ipv6addr), "%s:%s/64", ip6_prefix, suffix);
+        snprintf(ipv6addr, sizeof(ipv6addr), "%s:%s", ip6_prefix, suffix);
         ipv6list[i] = strdup(ipv6addr);
     }
     
