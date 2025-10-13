@@ -2251,6 +2251,405 @@ static void printMg(struct mg_str *mgstr) {
   printf("\n--------------\n");
 }
 
+static int block_port(int port) {
+    char command[256];
+    snprintf(command, sizeof(command), "ufw deny %d/tcp 2>/dev/null", port);
+    int result = system(command);
+    return (result == 0);
+}
+
+// Function to unblock a port using ufw
+static int unblock_port(int port) {
+    char command[256];
+    snprintf(command, sizeof(command), "ufw allow %d/tcp 2>/dev/null", port);
+    int result = system(command);
+    return (result == 0);
+}
+
+// Function to check if a port is blocked
+static int is_port_blocked(int port) {
+    char command[256];
+    snprintf(command, sizeof(command), "ufw status | grep -E '^%d/tcp.*DENY' > /dev/null", port);
+    int result = system(command);
+    return (result == 0);
+}
+
+// HTTP handler for block endpoint
+static void handle_block_port(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract port
+    json_object *port_obj;
+    if (!json_object_object_get_ex(root, "port", &port_obj) || 
+        !json_object_is_type(port_obj, json_type_int)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing port\"}");
+        return;
+    }
+    
+    int port = json_object_get_int(port_obj);
+    
+    // Validate port range
+    if (port < 1 || port > 65535) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid port range (1-65535)\"}");
+        return;
+    }
+    
+    // Block the port
+    if (block_port(port)) {
+        mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                      "{\"status\":\"success\", \"message\":\"Port %d blocked\", \"port\":%d}", 
+                      port, port);
+    } else {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to block port %d\"}", port);
+    }
+    
+    json_object_put(root);
+}
+
+// HTTP handler for unblock endpoint
+static void handle_unblock_port(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract port
+    json_object *port_obj;
+    if (!json_object_object_get_ex(root, "port", &port_obj) || 
+        !json_object_is_type(port_obj, json_type_int)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing port\"}");
+        return;
+    }
+    
+    int port = json_object_get_int(port_obj);
+    
+    // Validate port range
+    if (port < 1 || port > 65535) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid port range (1-65535)\"}");
+        return;
+    }
+    
+    // Unblock the port
+    if (unblock_port(port)) {
+        mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                      "{\"status\":\"success\", \"message\":\"Port %d unblocked\", \"port\":%d}", 
+                      port, port);
+    } else {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to unblock port %d\"}", port);
+    }
+    
+    json_object_put(root);
+}
+
+// HTTP handler for port status endpoint
+static void handle_port_status(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract port
+    json_object *port_obj;
+    if (!json_object_object_get_ex(root, "port", &port_obj) || 
+        !json_object_is_type(port_obj, json_type_int)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing port\"}");
+        return;
+    }
+    
+    int port = json_object_get_int(port_obj);
+    
+    // Validate port range
+    if (port < 1 || port > 65535) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid port range (1-65535)\"}");
+        return;
+    }
+    
+    // Check port status
+    int is_blocked = is_port_blocked(port);
+    
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                  "{\"port\":%d, \"status\":\"%s\", \"blocked\":%s}", 
+                  port, is_blocked ? "blocked" : "allowed", 
+                  is_blocked ? "true" : "false");
+    
+    json_object_put(root);
+}
+
+// HTTP handler to block multiple ports
+static void handle_block_ports(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract ports array
+    json_object *ports_obj;
+    if (!json_object_object_get_ex(root, "ports", &ports_obj) || 
+        !json_object_is_type(ports_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing ports array\"}");
+        return;
+    }
+    
+    // Create response array
+    json_object *response_array = json_object_new_array();
+    int success_count = 0;
+    int total_ports = json_object_array_length(ports_obj);
+    
+    // Process each port
+    for (int i = 0; i < total_ports; i++) {
+        json_object *port_item = json_object_array_get_idx(ports_obj, i);
+        
+        if (!json_object_is_type(port_item, json_type_int)) {
+            continue;
+        }
+        
+        int port = json_object_get_int(port_item);
+        
+        // Validate port range
+        if (port < 1 || port > 65535) {
+            continue;
+        }
+        
+        // Block the port
+        if (block_port(port)) {
+            json_object *result_obj = json_object_new_object();
+            json_object_object_add(result_obj, "port", json_object_new_int(port));
+            json_object_object_add(result_obj, "status", json_object_new_string("blocked"));
+            json_object_array_add(response_array, result_obj);
+            success_count++;
+        }
+    }
+    
+    // Generate response
+    const char *response_str = json_object_to_json_string(response_array);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                  "{\"status\":\"success\", \"message\":\"Blocked %d of %d ports\", \"results\":%s}", 
+                  success_count, total_ports, response_str);
+    
+    json_object_put(response_array);
+    json_object_put(root);
+}
+
+// HTTP handler to unblock multiple ports
+static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract ports array
+    json_object *ports_obj;
+    if (!json_object_object_get_ex(root, "ports", &ports_obj) || 
+        !json_object_is_type(ports_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing ports array\"}");
+        return;
+    }
+    
+    // Create response array
+    json_object *response_array = json_object_new_array();
+    int success_count = 0;
+    int total_ports = json_object_array_length(ports_obj);
+    
+    // Process each port
+    for (int i = 0; i < total_ports; i++) {
+        json_object *port_item = json_object_array_get_idx(ports_obj, i);
+        
+        if (!json_object_is_type(port_item, json_type_int)) {
+            continue;
+        }
+        
+        int port = json_object_get_int(port_item);
+        
+        // Validate port range
+        if (port < 1 || port > 65535) {
+            continue;
+        }
+        
+        // Unblock the port
+        if (unblock_port(port)) {
+            json_object *result_obj = json_object_new_object();
+            json_object_object_add(result_obj, "port", json_object_new_int(port));
+            json_object_object_add(result_obj, "status", json_object_new_string("unblocked"));
+            json_object_array_add(response_array, result_obj);
+            success_count++;
+        }
+    }
+    
+    // Generate response
+    const char *response_str = json_object_to_json_string(response_array);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                  "{\"status\":\"success\", \"message\":\"Unblocked %d of %d ports\", \"results\":%s}", 
+                  success_count, total_ports, response_str);
+    
+    json_object_put(response_array);
+    json_object_put(root);
+}
+
+// HTTP handler to get status of multiple ports
+static void handle_ports_status(struct mg_connection *c, struct mg_http_message *hm) {
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract ports array
+    json_object *ports_obj;
+    if (!json_object_object_get_ex(root, "ports", &ports_obj) || 
+        !json_object_is_type(ports_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing ports array\"}");
+        return;
+    }
+    
+    // Create response array
+    json_object *response_array = json_object_new_array();
+    int total_ports = json_object_array_length(ports_obj);
+    
+    // Process each port
+    for (int i = 0; i < total_ports; i++) {
+        json_object *port_item = json_object_array_get_idx(ports_obj, i);
+        
+        if (!json_object_is_type(port_item, json_type_int)) {
+            continue;
+        }
+        
+        int port = json_object_get_int(port_item);
+        
+        // Validate port range
+        if (port < 1 || port > 65535) {
+            continue;
+        }
+        
+        // Check port status
+        int is_blocked = is_port_blocked(port);
+        
+        json_object *result_obj = json_object_new_object();
+        json_object_object_add(result_obj, "port", json_object_new_int(port));
+        json_object_object_add(result_obj, "status", json_object_new_string(is_blocked ? "blocked" : "allowed"));
+        json_object_object_add(result_obj, "blocked", json_object_new_boolean(is_blocked));
+        json_object_array_add(response_array, result_obj);
+    }
+    
+    // Generate response
+    const char *response_str = json_object_to_json_string(response_array);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    
+    json_object_put(response_array);
+    json_object_put(root);
+}
+
 // HTTP server event handler function
 static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_MSG) {
@@ -2374,6 +2773,30 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       else if (mg_match(hm->uri, mg_str("/create-proxy"), NULL)) {
           handle_regenerate_proxy(c, hm);
           return;
+      }
+      else if (mg_match(hm->uri, mg_str("/block"), NULL)) {
+        handle_block_port(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/unblock"), NULL)) {
+        handle_unblock_port(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/port-status"), NULL)) {
+        handle_port_status(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/block-ports"), NULL)) {
+        handle_block_ports(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/unblock-ports"), NULL)) {
+        handle_unblock_ports(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/ports-status"), NULL)) {
+        handle_ports_status(c, hm);
+        return;
       }
       else {
         goto send_errmsg;
