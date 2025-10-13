@@ -1537,8 +1537,8 @@ static void handle_delete_proxies(struct mg_connection *c, struct mg_http_messag
         printf("Config update successful, restarting service...\n");
         
         // Restart 3proxy service
-        int restart_result = restart_3proxy_service();
-        printf("Service restart result: %d\n", restart_result);
+        //int restart_result = restart_3proxy_service();
+        //printf("Service restart result: %d\n", restart_result);
         
         // In handle_delete_proxies function, before removing IPv6:
         printf("Removing %d IPv6 addresses\n", ipv6_count);
@@ -2187,8 +2187,8 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
     // Write new configuration
     if (success_count > 0 && write_3proxy_config(new_config)) {
         
-        int restart_result = restart_3proxy_service();
-        printf("Service restart result: %d\n", restart_result);
+        //int restart_result = restart_3proxy_service();
+        //printf("Service restart result: %d\n", restart_result);
         
         // Create detailed response
         json_object *response_obj = json_object_new_object();
