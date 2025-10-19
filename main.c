@@ -39,6 +39,17 @@ enum {
   RADIUS
 };
 
+#define MAX_BUFFER 1024
+
+typedef struct {
+    char name[32];
+    int is_running;
+    char pid[64];
+} ServiceStatus;
+
+double cpu_usage = 0, disk_usage = 0;
+double mem_used = 0;
+
 typedef void (*sighandler_t) (int);
 
 char* test_proxy(const char* proxy, const char* tipo);
@@ -118,6 +129,139 @@ static void run_command(char *command) {
 
   printf("%s\nScript executed successfully.\n", command);
 
+}
+
+static void calc_disk_usage(const char *path) {
+    struct statvfs vfs;
+
+    if (statvfs(path, &vfs) != 0) {
+        perror("statvfs failed");
+        return;
+    }
+
+    // Calculate values in bytes
+    unsigned long long total = vfs.f_blocks * vfs.f_frsize;
+    unsigned long long available = vfs.f_bavail * vfs.f_frsize;
+    unsigned long long used = (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize;
+    
+    // Calculate percentages
+    double used_percent = (double)(vfs.f_blocks - vfs.f_bfree) / vfs.f_blocks * 100;
+    double avail_percent = (double)vfs.f_bavail / vfs.f_blocks * 100;
+
+    /*printf("Disk usage for %s:\n", path);
+    printf("Total: %.2f GB\n", (double)total / (1024 * 1024 * 1024));
+    printf("Used:  %.2f GB (%.1f%%)\n", (double)used / (1024 * 1024 * 1024), used_percent);
+    printf("Avail: %.2f GB (%.1f%%)\n", (double)available / (1024 * 1024 * 1024), avail_percent);*/
+
+    disk_usage  = used_percent;
+}
+
+static void calc_cpu_memory_usage() {
+	struct sysinfo info;
+
+	sysinfo(&info);
+
+	// Calculate memory values
+    unsigned long total_mem = info.totalram * info.mem_unit;
+    unsigned long free_mem = info.freeram * info.mem_unit;
+    unsigned long used_mem = total_mem - free_mem;
+    
+    // Calculate buffer/cache memory (if needed)
+    unsigned long buffer_cache = info.bufferram * info.mem_unit;
+    unsigned long actual_used = used_mem - buffer_cache;
+    unsigned long actual_free = free_mem + buffer_cache;
+
+    // Print results in human-readable format
+    /*printf("Memory Usage:\n");
+    printf("Total:     %.2f MB\n", (double)total_mem / (1024 * 1024));
+    printf("Used:      %.2f MB (%.1f%%)\n", 
+           (double)used_mem / (1024 * 1024),
+           (double)used_mem / total_mem * 100);
+    printf("Free:      %.2f MB (%.1f%%)\n", 
+           (double)free_mem / (1024 * 1024),
+           (double)free_mem / total_mem * 100);
+    printf("Actual Used (excl. buffers/cache): %.2f MB\n",
+           (double)actual_used / (1024 * 1024));
+    printf("Actual Free (incl. buffers/cache): %.2f MB\n",
+           (double)actual_free / (1024 * 1024));*/
+
+    cpu_usage = (double)info.loads[0] / (1 << SI_LOAD_SHIFT);
+    mem_used = (double)actual_used/total_mem*100;
+    
+	/*snprintf(infostr, sizeof(infostr), "CPU 1-min Load Avg: %.2f, Memory Usage: %lu MB / %lu MB (%.2f%%)", 
+		(double)info.loads[0] / (1 << SI_LOAD_SHIFT), used_ram/1024/1024, total_ram/1024/1024, (double)used_ram / total_ram * 100.0);*/
+}
+
+static void *resource_usage_thread(void *) {
+    while(1) {
+        calc_cpu_memory_usage();
+        calc_disk_usage("/");
+        sleep(5);
+    }
+
+    return NULL;
+
+}
+
+// Function to check service status and get PID
+void check_service_status(ServiceStatus *service) {
+    char command[MAX_BUFFER];
+    char buffer[MAX_BUFFER];
+    FILE *fp;
+
+    // Construct the pidof command
+    snprintf(command, sizeof(command), "pidof %s", service->name);
+
+    // Execute the command
+    fp = popen(command, "r");
+    if (fp == NULL) {
+        service->is_running = -1;
+        strcpy(service->pid, "ERROR");
+        return;
+    }
+
+    // Read the output
+    if (fgets(buffer, sizeof(buffer), fp) != NULL) {
+        service->is_running = 1;
+        // Remove newline and copy PID
+        buffer[strcspn(buffer, "\n")] = '\0';
+        strncpy(service->pid, buffer, sizeof(service->pid) - 1);
+        service->pid[sizeof(service->pid) - 1] = '\0';
+    } else {
+        service->is_running = 0;
+        strcpy(service->pid, "NOT_FOUND");
+    }
+
+    pclose(fp);
+}
+
+char* get_json_output(ServiceStatus services[], int count) {
+    struct json_object *root = json_object_new_object();
+    struct json_object *services_array = json_object_new_array();
+    
+    for (int i = 0; i < count; i++) {
+        struct json_object *service_obj = json_object_new_object();
+        
+        json_object_object_add(service_obj, "name", 
+                              json_object_new_string(services[i].name));
+        json_object_object_add(service_obj, "status", 
+                              json_object_new_string(services[i].is_running ? "running" : "stopped"));
+        /*json_object_object_add(service_obj, "pid", 
+                              json_object_new_string(services[i].is_running ? services[i].pid : "N/A"));*/
+        
+        json_object_array_add(services_array, service_obj);
+    }
+    
+    json_object_object_add(root, "services", services_array);
+    
+    // Convert to string and make a copy (important!)
+    const char *json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    char *result = strdup(json_str);  // Create a copy that won't be freed
+    
+    // Clean up the JSON objects
+    json_object_put(root);
+    
+    return result;
 }
 
 static void parse_query(const char* query, char* ip, int* count) 
@@ -2197,12 +2341,12 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         char message[512];
         if (broken_fixed_count > 0) {
             snprintf(message, sizeof(message), 
-                    "Processed %d proxies: %ld regenerated, %d failed", 
+                    "Processed %d proxies: %d regenerated, %ld failed", 
                     proxies_len, success_count, 
                     json_object_array_length(failed_users));
         } else {
             snprintf(message, sizeof(message), 
-                    "Processed %d proxies: %ld regenerated, %d failed", 
+                    "Processed %d proxies: %d regenerated, %ld failed", 
                     proxies_len, success_count, 
                     json_object_array_length(failed_users));
         }
@@ -2715,6 +2859,48 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           mg_http_reply(c, 500, "", "{\"%m\":\"%m\"}\n", MG_ESC("error"), MG_ESC("Syntax Error")); 
         }
       }
+      else if( mg_match(hm->uri, mg_str("/resource-usage"), NULL) ) {
+        char disk_str[32], cpu_str[32], memory_str[32];
+    
+        snprintf(disk_str, sizeof(disk_str), "%.2f%%", disk_usage);
+        snprintf(cpu_str, sizeof(cpu_str), "%.2f%%", cpu_usage);
+        snprintf(memory_str, sizeof(memory_str), "%.2f%%", mem_used);
+
+        // Create a JSON object
+        struct json_object *root = json_object_new_object();
+        
+        // Add the values
+        json_object_object_add(root, "disk", json_object_new_string(disk_str));
+        json_object_object_add(root, "cpu", json_object_new_string(cpu_str));
+        json_object_object_add(root, "memory", json_object_new_string(memory_str));
+        
+        // Convert to JSON string
+        const char *json_str = json_object_to_json_string(root);
+        printf("%s\n", json_str);
+        mg_http_reply(c, 200, "", "%s\n", json_str);
+        // Clean up
+        json_object_put(root);
+      }
+      else if( mg_match(hm->uri, mg_str("/service-status"), NULL) ) {
+        ServiceStatus services[] = {
+            {"3proxy", 0, ""},
+            {"ftpclient", 0, ""},
+            {"trafficmonitor", 0, ""}
+        };
+        
+        int num_services = sizeof(services) / sizeof(services[0]);
+
+        // Check status of all services
+        for (int i = 0; i < num_services; i++) {
+            check_service_status(&services[i]);
+        }
+
+        char *json_string = get_json_output(services, num_services);
+        printf("JSON String: %s\n", json_string);
+
+        mg_http_reply(c, 200, "", "%s\n", json_string);
+        free(json_string);
+      }
       else if( mg_match(hm->uri, mg_str("/ping"), NULL) ) {
         char query[256], clientip[MAX_IP_LENGTH];
         int count;
@@ -2830,9 +3016,9 @@ int main(int argc, char* argv[])
   DIR *dir;
   char path[256];
   int pid;
-	FILE *pid_stream;
+  FILE *pid_stream;
   int firstrun = 1;
-  pthread_t thread_id, cpu_thread, mem_thread;
+  pthread_t resource_thread;
 
   if(argc < 1) {
     fprintf(stderr, "Usage: %s\n", argv[0]);
@@ -2862,13 +3048,12 @@ int main(int argc, char* argv[])
       return EXIT_FAILURE;
   }*/
 
-  /*rc = pthread_create(&mem_thread, NULL, mem_usage_thread, NULL);
+  int rc = pthread_create(&resource_thread, NULL, resource_usage_thread, NULL);
   if (rc != 0) {
       fprintf(stderr, "Error creating thread: %d\n", rc);
       return EXIT_FAILURE;
-  }*/
- 
- 
+  }
+  
   struct mg_mgr mgr;  // Declare event manager
   mg_mgr_init(&mgr);  // Initialise event manager
   mg_http_listen(&mgr, "http://0.0.0.0:8001", api_ev_handler, NULL);  // Setup listener
