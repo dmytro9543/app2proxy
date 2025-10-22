@@ -1814,7 +1814,9 @@ static int write_3proxy_config(const char *content) {
     
     fprintf(file, "%s", content);
     fclose(file);
-    
+
+    printf("Writing complete!\nYou need to restart 3proxy service manually.\n");
+
     return 1;
 }
 
@@ -1862,7 +1864,7 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     //char* external_ip_removed_prefix = remove_ipv6_prefix(external_ip);
     
     // Common authentication and access control
-    strcat(config, "auth strong\n");
+    strcat(config, "\nauth strong\n");
     
     char allow_line[256];
     snprintf(allow_line, sizeof(allow_line), "allow %s\n", username);
@@ -2256,7 +2258,7 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         snprintf(allow_pattern, sizeof(allow_pattern), "allow %s", username);
         if (strstr(new_config, allow_pattern) != NULL) {
             proxy_exists = 1;
-            printf("Proxy for user %s exists but is broken - deleting and regenerating\n", username);
+            printf("Proxy for user %s exists - deleting and regenerating\n", username);
             
             // Delete the broken proxy
             if (delete_proxy_by_username_simple(username) == 0) {
@@ -2794,6 +2796,110 @@ static void handle_ports_status(struct mg_connection *c, struct mg_http_message 
     json_object_put(root);
 }
 
+static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_message *hm) {
+  // Parse JSON body
+  char *body_str = malloc(hm->body.len + 1);
+  if (!body_str) {
+    mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                  "{\"error\":\"Memory allocation failed\"}");
+    return;
+  }
+  
+  memcpy(body_str, hm->body.buf, hm->body.len);
+  body_str[hm->body.len] = '\0';
+  
+  json_object *root = json_tokener_parse(body_str);
+  free(body_str);
+  
+  if (!root) {
+    mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                  "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  
+  // Extract IPv6 addresses array
+  json_object *addresses_obj;
+  if (!json_object_object_get_ex(root, "addresses", &addresses_obj) || 
+      !json_object_is_type(addresses_obj, json_type_array)) {
+    json_object_put(root);
+    mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                  "{\"error\":\"Invalid or missing addresses array\"}");
+    return;
+  }
+  
+  // Create response array
+  json_object *response_array = json_object_new_array();
+  int success_count = 0;
+  int total_addresses = json_object_array_length(addresses_obj);
+  
+  // Process each IPv6 address
+  for (int i = 0; i < total_addresses; i++) {
+    json_object *address_item = json_object_array_get_idx(addresses_obj, i);
+    
+    if (!json_object_is_type(address_item, json_type_object)) {
+      continue;
+    }
+    
+    // Extract address details
+    json_object *interface_obj, *address_obj;
+    const char *interface, *address;
+    
+    if (!json_object_object_get_ex(address_item, "interface", &interface_obj) ||
+        !json_object_object_get_ex(address_item, "address", &address_obj)) {
+      continue;
+    }
+    
+    interface = json_object_get_string(interface_obj);
+    address = json_object_get_string(address_obj);
+    
+    // Validate inputs
+    if (!interface || strlen(interface) == 0 || 
+        !address || strlen(address) == 0) {
+      json_object *result_obj = json_object_new_object();
+      json_object_object_add(result_obj, "interface", json_object_new_string(interface ? interface : "unknown"));
+      json_object_object_add(result_obj, "address", json_object_new_string(address ? address : "unknown"));
+      json_object_object_add(result_obj, "status", json_object_new_string("invalid_input"));
+      json_object_array_add(response_array, result_obj);
+      continue;
+    }
+    
+    // Add the IPv6 address to the interface (using fixed /128 prefix length)
+    if (add_ipv6_to_interface(address, interface)) {
+      json_object *result_obj = json_object_new_object();
+      json_object_object_add(result_obj, "interface", json_object_new_string(interface));
+      json_object_object_add(result_obj, "address", json_object_new_string(address));
+      json_object_object_add(result_obj, "status", json_object_new_string("added"));
+      json_object_array_add(response_array, result_obj);
+      success_count++;
+    } else {
+      json_object *result_obj = json_object_new_object();
+      json_object_object_add(result_obj, "interface", json_object_new_string(interface));
+      json_object_object_add(result_obj, "address", json_object_new_string(address));
+      json_object_object_add(result_obj, "status", json_object_new_string("failed"));
+      json_object_array_add(response_array, result_obj);
+    }
+  }
+  
+  // Generate response
+  json_object *response_root = json_object_new_object();
+  json_object_object_add(response_root, "status", json_object_new_string(success_count > 0 ? "success" : "partial"));
+  json_object_object_add(response_root, "message", 
+                         json_object_new_string(success_count == total_addresses ? 
+                             "All IPv6 addresses added successfully" :
+                             success_count > 0 ?
+                             "Some IPv6 addresses added successfully" :
+                             "Failed to add IPv6 addresses"));
+  json_object_object_add(response_root, "added", json_object_new_int(success_count));
+  json_object_object_add(response_root, "total", json_object_new_int(total_addresses));
+  json_object_object_add(response_root, "results", response_array);
+  
+  const char *response_str = json_object_to_json_string(response_root);
+  mg_http_reply(c, success_count > 0 ? 200 : 400, "Content-Type: application/json\r\n", "%s", response_str);
+  
+  json_object_put(response_root);
+  json_object_put(root);
+}
+
 // HTTP server event handler function
 static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_MSG) {
@@ -2982,6 +3088,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       }
       else if (mg_match(hm->uri, mg_str("/ports-status"), NULL)) {
         handle_ports_status(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/load-ipv6"), NULL)) {
+        handle_add_ipv6_address(c, hm);
         return;
       }
       else {
