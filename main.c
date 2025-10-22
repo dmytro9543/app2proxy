@@ -1681,8 +1681,8 @@ static void handle_delete_proxies(struct mg_connection *c, struct mg_http_messag
         printf("Config update successful, restarting service...\n");
         
         // Restart 3proxy service
-        //int restart_result = restart_3proxy_service();
-        //printf("Service restart result: %d\n", restart_result);
+        int restart_result = restart_3proxy_service();
+        printf("Service restart result: %d\n", restart_result);
         
         // In handle_delete_proxies function, before removing IPv6:
         printf("Removing %d IPv6 addresses\n", ipv6_count);
@@ -1815,7 +1815,7 @@ static int write_3proxy_config(const char *content) {
     fprintf(file, "%s", content);
     fclose(file);
 
-    printf("Writing complete!\nYou need to restart 3proxy service manually.\n");
+    printf("Writing complete!\n");
 
     return 1;
 }
@@ -1864,7 +1864,7 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     //char* external_ip_removed_prefix = remove_ipv6_prefix(external_ip);
     
     // Common authentication and access control
-    strcat(config, "\nauth strong\n");
+    strcat(config, "\n\nauth strong\n");
     
     char allow_line[256];
     snprintf(allow_line, sizeof(allow_line), "allow %s\n", username);
@@ -1917,7 +1917,7 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
 	printf("Generated Parent config");
     }
     
-    strcat(config, "flush\n\n");
+    strcat(config, "flush\n");
     printf("Generated config:\n%s\n", config);
 
     //free(external_ip_removed_prefix);
@@ -2333,8 +2333,8 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
     // Write new configuration
     if (success_count > 0 && write_3proxy_config(new_config)) {
         
-        //int restart_result = restart_3proxy_service();
-        //printf("Service restart result: %d\n", restart_result);
+        int restart_result = restart_3proxy_service();
+        printf("Service restart result: %d\n", restart_result);
         
         // Create detailed response
         json_object *response_obj = json_object_new_object();
