@@ -28,6 +28,8 @@
 
 #define CONFIG_PATH "/etc/3proxy/3proxy.cfg"
 
+#define VERSION_STRING "1.2.0"
+
 int main_pid = 0;
 int no_fork = 0;
 char *pid_file = BNG_EXPORT_PID_FILE;
@@ -1310,6 +1312,7 @@ static char* extract_ipv6_address(const char* block) {
 
 // Function to restart 3proxy service
 static int restart_3proxy_service() {
+    printf("3proxy service restart...\n");
     int result = system("service 3proxy restart");
     if (result == 0) {
         printf("3proxy service restarted successfully\n");
@@ -1373,7 +1376,7 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
         }
         
         // Check if we're starting a proxy block with auth strong
-        if (strstr(line, "auth strong") != NULL) {
+        if (strstr(line, "flush") != NULL) {
             // If we're already in a block (from a comment header), just mark that we found auth
             if (in_proxy_block) {
                 found_auth_in_block = 1;
@@ -1433,7 +1436,7 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
             }
         }
         // Check for flush line (end of proxy block)
-        else if (in_proxy_block && strstr(line, "flush") != NULL) {
+        else if (in_proxy_block && (strstr(line, "socks") != NULL || strstr(line, "proxy") != NULL)) {
             // Add flush line to block
             size_t len = strlen(line);
             if (block_pos + len + 2 < sizeof(block_buffer)) {
@@ -1580,6 +1583,7 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
     printf("Successfully updated config file. Removed %d IPv6 addresses.\n", *ipv6_count);
     return 0;
 }
+
 // HTTP handler for deleting proxies
 static void handle_delete_proxies(struct mg_connection *c, struct mg_http_message *hm) {
     printf("=== Starting delete_proxies handler ===\n");
@@ -1763,12 +1767,37 @@ static void handle_delete_proxies(struct mg_connection *c, struct mg_http_messag
 }
 
 // Function to add IPv6 address to interface
-static int add_ipv6_to_interface(const char *ipv6_address, const char *interface) {
+static int add_ipv6_to_interface(const char *ipv6_address, const char *interface, char *error_str, size_t error_size) {
     char command[256];
-    snprintf(command, sizeof(command), "ip -6 addr add %s/128 dev %s 2>/dev/null", ipv6_address, interface);
     
-    int result = system(command);
-    printf("IPv6 add result: %s, %d\n", command, result);
+    snprintf(command, sizeof(command), "ip -6 addr add %s/128 dev %s 2>&1", ipv6_address, interface);
+    
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        snprintf(error_str, error_size, "Failed to execute command");
+        return -1;
+    }
+    
+    // Read the command output (including errors)
+    char output[1024] = {0};
+    size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
+    output[bytes_read] = '\0';
+    
+    int result = pclose(fp);
+    
+    // Copy output to error string (will contain error message if command failed)
+    strncpy(error_str, output, error_size - 1);
+    error_str[error_size - 1] = '\0';
+
+    if(!strlen(error_str)) {
+        snprintf(error_str, error_size, "Success");
+    } else if( strstr(error_str, "exists") ) {
+        snprintf(error_str, error_size, "Address exists");
+    }
+    
+    printf("IPv6 add result: %s, exit code: %d\n", command, result);
+    printf("Output: %s\n", output);
+    
     return (result == 0);
 }
 
@@ -1864,7 +1893,7 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     //char* external_ip_removed_prefix = remove_ipv6_prefix(external_ip);
     
     // Common authentication and access control
-    strcat(config, "\n\nauth strong\n");
+    strcat(config, "flush\ninclude /conf/blacklist.txt\n");
     
     char allow_line[256];
     snprintf(allow_line, sizeof(allow_line), "allow %s\n", username);
@@ -1917,7 +1946,6 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
 	printf("Generated Parent config");
     }
     
-    strcat(config, "flush\n");
     printf("Generated config:\n%s\n", config);
 
     //free(external_ip_removed_prefix);
@@ -2016,11 +2044,11 @@ static int delete_proxy_by_username_simple(const char *username) {
     
     while (*current) {
         // Look for proxy blocks
-        if (strncmp(current, "auth strong", 11) == 0) {
+        if (strncmp(current, "flush", 5) == 0) {
             char *block_start = current;
             
             // Find the end of this block (next auth strong or end of file)
-            char *block_end = strstr(current + 11, "auth strong");
+            char *block_end = strstr(current + 5, "flush");
             if (!block_end) {
                 block_end = config + strlen(config);
             }
@@ -2032,8 +2060,7 @@ static int delete_proxy_by_username_simple(const char *username) {
             
             // Look for "allow username" in this block
             char allow_pattern[99999];
-            snprintf(allow_pattern, sizeof(allow_pattern), "allow %s", username);
-            
+            snprintf(allow_pattern, sizeof(allow_pattern), "allow %s\n", username);
             if (strstr(block_segment, allow_pattern) != NULL) {
                 // Skip this block - don't copy it to new config
                 printf("Skipping block for user %s\n", username);
@@ -2284,9 +2311,10 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         // For IPv6 proxies, add the IPv6 address to the interface
         if (strstr(proxy_type, "ipv6") != NULL && external_ip[0] != '\0') {
             printf("Adding IPv6 address to interface...\n");
-            if (!add_ipv6_to_interface(external_ip, interface)) {
-                printf("Warning: Failed to add IPv6 address %s to interface %s\n", 
-                       external_ip, interface);
+            char error_msg[256];
+            if (!add_ipv6_to_interface(external_ip, interface, error_msg, sizeof(error_msg))) {
+                printf("Warning: Failed to add IPv6 address %s to interface %s, msg: %s\n", 
+                       external_ip, interface, error_msg);
                 // Continue anyway - the IP might already be there
             }
         }
@@ -2306,9 +2334,17 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
                                                   password, external_ip, parent_info);
         if (proxy_config) {
             // Append to configuration
-            char *combined_config = malloc(strlen(new_config) + strlen(proxy_config) + 1);
+            char *combined_config = malloc(strlen(new_config) + strlen(proxy_config) + 32);
             if (combined_config) {
                 strcpy(combined_config, new_config);
+                if(combined_config[strlen(combined_config)-1] != '\n') {
+                    printf("Added new 2 lines\n");
+                    strcat(combined_config, "\n\n");
+                }
+                if(combined_config[strlen(combined_config)-2] != '\n') {
+                    printf("Added new line\n");
+                    strcat(combined_config, "\n");
+                }
                 strcat(combined_config, proxy_config);
                 free(new_config);
                 new_config = combined_config;
@@ -2328,10 +2364,12 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
             printf("Failed to generate proxy config for user %s\n", username);
             json_object_array_add(failed_users, json_object_new_string(username));
         }
+
+        write_3proxy_config(new_config);
     }
     
     // Write new configuration
-    if (success_count > 0 && write_3proxy_config(new_config)) {
+    if (success_count > 0) {
         
         int restart_result = restart_3proxy_service();
         printf("Service restart result: %d\n", restart_result);
@@ -2862,20 +2900,21 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
       json_object_array_add(response_array, result_obj);
       continue;
     }
-    
+
+    char error_msg[256];
     // Add the IPv6 address to the interface (using fixed /128 prefix length)
-    if (add_ipv6_to_interface(address, interface)) {
+    if (add_ipv6_to_interface(address, interface, error_msg, sizeof(error_msg))) {
       json_object *result_obj = json_object_new_object();
       json_object_object_add(result_obj, "interface", json_object_new_string(interface));
       json_object_object_add(result_obj, "address", json_object_new_string(address));
-      json_object_object_add(result_obj, "status", json_object_new_string("added"));
+      json_object_object_add(result_obj, "status", json_object_new_string(error_msg));
       json_object_array_add(response_array, result_obj);
       success_count++;
     } else {
       json_object *result_obj = json_object_new_object();
       json_object_object_add(result_obj, "interface", json_object_new_string(interface));
       json_object_object_add(result_obj, "address", json_object_new_string(address));
-      json_object_object_add(result_obj, "status", json_object_new_string("failed"));
+      json_object_object_add(result_obj, "status", json_object_new_string(error_msg));
       json_object_array_add(response_array, result_obj);
     }
   }
@@ -3137,7 +3176,10 @@ int main(int argc, char* argv[])
 
   if(argc == 2 && !strcmp(argv[1], "nofork")) {
       // nothing to do
-  } else {
+  } else if(argc == 2 && !strcmp(argv[1], "--version")) {
+      printf("version: %s\n", VERSION_STRING);
+      exit(0);
+  }  else {
     if ((pid=fork())<0){
       printf("Cannot fork: %s.\n", strerror(errno));
       return -1;
