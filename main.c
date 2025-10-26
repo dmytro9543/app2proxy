@@ -1952,69 +1952,215 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     
     return config;
 }
-
-// Function to add user to 3proxy users line
+// Function to add user to 3proxy users line - DEBUGGED VERSION
 static char* update_users_line(const char *current_config, const char *username, const char *password) {
-    printf("Updating users line...");
+    printf("Updating users line...\n");
     
-    char *users_start = strstr(current_config, "users ");
-    if (!users_start) {
-        printf("Users line not found in config!\n");
+    // Validate inputs
+    if (!current_config || !username || !password) {
+        printf("ERROR: Null parameters\n");
         return NULL;
     }
     
+    // Validate username and password lengths
+    size_t username_len = strlen(username);
+    size_t password_len = strlen(password);
+    if (username_len == 0 || username_len > 50 || password_len == 0 || password_len > 50) {
+        printf("ERROR: Invalid username or password length\n");
+        return NULL;
+    }
+    
+    //printf("DEBUG: Looking for users line in config...\n");
+    
+    // Find users line - try different patterns
+    char *users_start = strstr(current_config, "users ");
+    if (!users_start) {
+        users_start = strstr(current_config, "users\n");
+        if (!users_start) {
+            printf("ERROR: Users line not found in config!\n");
+            printf("DEBUG: Config starts with: %.100s\n", current_config);
+            return NULL;
+        }
+    }
+    
+    //printf("DEBUG: Found users line at position: %ld\n", users_start - current_config);
+    
+    // Find end of users line
     char *users_end = strchr(users_start, '\n');
     if (!users_end) {
-        printf("Users line not properly terminated!\n");
-        return NULL;
+        // If no newline, users line goes to end of config
+        users_end = (char*)current_config + strlen(current_config);
+        printf("DEBUG: No newline found, using end of config\n");
     }
     
     // Calculate lengths
     size_t users_line_len = users_end - users_start;
-    size_t new_user_len = strlen(username) + strlen(password) + 5; // " :CL:" + username + password
+    size_t total_config_len = strlen(current_config);
     
-    // Create new users line
-    char *new_users_line = malloc(users_line_len + new_user_len + 2);
-    if (!new_users_line) return NULL;
-    
-    // Copy existing users line without the newline
-    strncpy(new_users_line, users_start, users_line_len);
-    new_users_line[users_line_len] = '\0';
+    //printf("DEBUG: Users line length: %zu, total config length: %zu\n", users_line_len, total_config_len);
+    //printf("DEBUG: Users line content: '%.*s'\n", (int)users_line_len, users_start);
     
     // Check if user already exists
-    char user_search[99999];
-    snprintf(user_search, sizeof(user_search), " %s:", username);
-    if (strstr(new_users_line, user_search) == NULL) {
-        // Add new user
-        strcat(new_users_line, " ");
+    char user_search[128];
+    int search_result = snprintf(user_search, sizeof(user_search), " %s:", username);
+    if (search_result < 0 || search_result >= (int)sizeof(user_search)) {
+        printf("ERROR: User search pattern too long\n");
+        return NULL;
+    }
+
+    if (strstr(users_start, user_search) != NULL) {
+        printf("User %s already exists in users line\n", username);
+        return NULL;
+    }
+    
+    // Calculate new sizes more carefully
+    size_t new_user_entry_len = username_len + password_len + 5; // " :CL:"
+    size_t total_new_size = users_line_len + new_user_entry_len + 10; // Extra padding
+    
+    //printf("DEBUG: Allocating new_users_line with size: %zu\n", total_new_size);
+    
+    // Create new users line
+    char *new_users_line = calloc(total_new_size, 1);
+    if (!new_users_line) {
+        printf("ERROR: Failed to allocate new_users_line\n");
+        return NULL;
+    }
+    
+    // Copy existing users line (without newline if present)
+    if (users_line_len > 0) {
+        strncpy(new_users_line, users_start, users_line_len);
+        new_users_line[users_line_len] = '\0';
+    }
+    
+    // Remove trailing newline if it exists
+    size_t current_len = strlen(new_users_line);
+    if (current_len > 0 && new_users_line[current_len - 1] == '\n') {
+        new_users_line[current_len - 1] = '\0';
+        current_len--;
+    }
+    
+    //printf("DEBUG: Current users line (cleaned): '%s'\n", new_users_line);
+    //printf("DEBUG: Current length: %zu, available space: %zu\n", current_len, total_new_size);
+    
+    // SAFELY add new user with bounds checking
+    
+    // Add space (only if not empty)
+    if (current_len > 0) {
+        if (current_len + 2 < total_new_size) {
+            strcat(new_users_line, " ");
+            current_len++;
+        } else {
+            printf("ERROR: Buffer overflow when adding space\n");
+            free(new_users_line);
+            return NULL;
+        }
+    }
+    
+    // Add username
+    if (current_len + username_len < total_new_size) {
         strcat(new_users_line, username);
-        strcat(new_users_line, ":CL:");
-        strcat(new_users_line, password);
-        printf("Added user: %s\n", username);
+        current_len += username_len;
     } else {
-        printf("User %s already exists\n", username);
+        printf("ERROR: Buffer overflow when adding username\n");
         free(new_users_line);
         return NULL;
     }
     
-    strcat(new_users_line, "\n");
+    // Add ":CL:"
+    if (current_len + 4 < total_new_size) {
+        strcat(new_users_line, ":CL:");
+        current_len += 4;
+    } else {
+        printf("ERROR: Buffer overflow when adding :CL:\n");
+        free(new_users_line);
+        return NULL;
+    }
     
-    // Replace the users line in the config
-    char *new_config = malloc(strlen(current_config) + new_user_len + 2);
+    // Add password
+    if (current_len + password_len < total_new_size) {
+        strcat(new_users_line, password);
+        current_len += password_len;
+    } else {
+        printf("ERROR: Buffer overflow when adding password\n");
+        free(new_users_line);
+        return NULL;
+    }
+    
+    // Add newline
+    /*if (current_len + 2 < total_new_size) {
+        strcat(new_users_line, "\n");
+        current_len++;
+    } else {
+        printf("ERROR: Buffer overflow when adding newline\n");
+        free(new_users_line);
+        return NULL;
+    }*/
+    
+    //printf("DEBUG: Successfully built new users line: '%s'\n", new_users_line);
+    
+    // Calculate sizes for new config
+    size_t prefix_len = users_start - current_config;
+    size_t new_users_line_len = strlen(new_users_line);
+    size_t suffix_len = strlen(users_end);
+    
+    //printf("DEBUG: prefix_len: %zu, new_users_line_len: %zu, suffix_len: %zu\n", 
+    //       prefix_len, new_users_line_len, suffix_len);
+    
+    // Allocate new config with plenty of extra space
+    size_t total_new_config_size = prefix_len + new_users_line_len + suffix_len + 256;
+    char *new_config = calloc(total_new_config_size, 1);
     if (!new_config) {
+        printf("ERROR: Failed to allocate new_config\n");
         free(new_users_line);
         return NULL;
     }
     
-    // Copy part before users line
-    strncpy(new_config, current_config, users_start - current_config);
-    new_config[users_start - current_config] = '\0';
+    //printf("DEBUG: Allocated new_config with size: %zu\n", total_new_config_size);
+    
+    // Build new config safely
+    // Copy prefix (part before users line)
+    if (prefix_len > 0) {
+        strncpy(new_config, current_config, prefix_len);
+        new_config[prefix_len] = '\0';
+    }
+    
+    //printf("DEBUG: After prefix copy: '%s'\n", new_config);
     
     // Add new users line
     strcat(new_config, new_users_line);
     
-    // Copy part after users line
-    strcat(new_config, users_end + 1);
+    //printf("DEBUG: After adding users line: '%s'\n", new_config);
+    
+    // Check if we need to add auth strong
+    int needs_auth_strong = 1;
+    char *auth_pos = strstr(users_end, "auth strong");
+    if (auth_pos) {
+        needs_auth_strong = 0;
+        printf("DEBUG: auth strong already exists\n");
+    } else {
+        printf("DEBUG: auth strong not found, will add it\n");
+    }
+    
+    // Add the rest of the config (after the original users line)
+    // Skip the original users line content
+    strcat(new_config, users_end);
+    
+    //printf("DEBUG: After adding suffix: '%s'\n", new_config);
+    
+    // Add auth strong if needed (add it right after users line)
+    if (needs_auth_strong) {
+        // Find where to insert auth strong - right after the new users line
+        char *insert_pos = strstr(new_config, new_users_line) + new_users_line_len;
+        if (insert_pos && insert_pos > new_config && insert_pos < new_config + total_new_config_size - 20) {
+            // Make space for "auth strong\n"
+            memmove(insert_pos + 13, insert_pos, strlen(insert_pos) + 1);
+            memcpy(insert_pos, "\n\nauth strong\n", 13);
+            printf("DEBUG: Added auth strong\n");
+        }
+    }
+    
+    printf("Successfully updated users line for user: %s\n", username);
+    //printf("Final new config length: %zu\n", strlen(new_config));
     
     free(new_users_line);
     return new_config;
@@ -2333,30 +2479,47 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         char *proxy_config = generate_proxy_config(proxy_type, host, port, username, 
                                                   password, external_ip, parent_info);
         if (proxy_config) {
-            // Append to configuration
-            char *combined_config = malloc(strlen(new_config) + strlen(proxy_config) + 32);
+            // Allocate with plenty of extra space
+            size_t total_size = strlen(new_config) + strlen(proxy_config) + 64;
+            char *combined_config = malloc(total_size);
+            
             if (combined_config) {
-                strcpy(combined_config, new_config);
-                if(combined_config[strlen(combined_config)-1] != '\n') {
-                    printf("Added new 2 lines\n");
-                    strcat(combined_config, "\n\n");
-                }
-                if(combined_config[strlen(combined_config)-2] != '\n') {
-                    printf("Added new line\n");
-                    strcat(combined_config, "\n");
-                }
-                strcat(combined_config, proxy_config);
-                free(new_config);
-                new_config = combined_config;
-                success_count++;
+                // Use snprintf for safe construction
+                int written = snprintf(combined_config, total_size, "%s", new_config);
                 
-                if (!proxy_exists) {
-                    json_object_array_add(regenerated_users, json_object_new_string(username));
+                if (written > 0 && written < total_size) {
+                    // Safe newline handling
+                    size_t current_len = strlen(combined_config);
+                    if (current_len == 0 || combined_config[current_len - 1] != '\n') {
+                        strncat(combined_config, "\n\n", total_size - current_len - 1);
+                    }
+                    
+                    current_len = strlen(combined_config);
+                    if (current_len > 0 && combined_config[current_len - 1] == '\n' && 
+                        current_len > 1 && combined_config[current_len - 2] != '\n') {
+                        strncat(combined_config, "\n", total_size - current_len - 1);
+                    }
+                    
+                    // Add proxy config
+                    current_len = strlen(combined_config);
+                    strncat(combined_config, proxy_config, total_size - current_len - 1);
+                    
+                    free(new_config);
+                    new_config = combined_config;
+                    success_count++;
+                    
+                    if (!proxy_exists) {
+                        json_object_array_add(regenerated_users, json_object_new_string(username));
+                    }
+                    
+                    printf("Successfully added proxy configuration for user %s\n", username);
+                } else {
+                    printf("Failed to construct combined config\n");
+                    free(combined_config);
+                    json_object_array_add(failed_users, json_object_new_string(username));
                 }
-                
-                printf("Successfully added proxy configuration for user %s\n", username);
             } else {
-                printf("Failed to combine config for user %s\n", username);
+                printf("Failed to allocate combined config\n");
                 json_object_array_add(failed_users, json_object_new_string(username));
             }
             free(proxy_config);
