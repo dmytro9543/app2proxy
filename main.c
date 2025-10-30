@@ -42,6 +42,7 @@ enum {
 };
 
 #define MAX_BUFFER 1024
+#define MAX_BLACKLIST_LINES 100000
 
 typedef struct {
     char name[32];
@@ -3102,6 +3103,268 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
   json_object_put(root);
 }
 
+void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) {
+    const char *blacklist_path = "/usr/local/3proxy/conf/blacklist.txt";
+    
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    // Parse JSON using json-c
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract action and domains
+    json_object *action_obj, *domains_obj;
+    if (!json_object_object_get_ex(root, "action", &action_obj) || 
+        !json_object_object_get_ex(root, "domains", &domains_obj) ||
+        !json_object_is_type(action_obj, json_type_string) ||
+        !json_object_is_type(domains_obj, json_type_array)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing action/domains array\"}");
+        return;
+    }
+    
+    const char *action = json_object_get_string(action_obj);
+    
+    // Validate action
+    if (strcmp(action, "add") != 0 && strcmp(action, "remove") != 0) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Action must be 'add' or 'remove'\"}");
+        return;
+    }
+    
+    // Validate domains array
+    int domains_count = json_object_array_length(domains_obj);
+    if (domains_count == 0) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Domains array is empty\"}");
+        return;
+    }
+    
+    // Read current blacklist
+    FILE *file = fopen(blacklist_path, "r");
+    if (!file) {
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Cannot open blacklist file\"}");
+        return;
+    }
+    
+    // Read all lines into memory
+    char lines[MAX_BLACKLIST_LINES][256];
+    int line_count = 0;
+    
+    while (fgets(lines[line_count], sizeof(lines[0]), file) && line_count < MAX_BLACKLIST_LINES) {
+        lines[line_count][strcspn(lines[line_count], "\n")] = 0;
+        line_count++;
+    }
+    fclose(file);
+    
+    // Create response object and lists
+    json_object *response_obj = json_object_new_object();
+    json_object *added_list = json_object_new_array();
+    json_object *exists_list = json_object_new_array();
+    json_object *removed_list = json_object_new_array();
+    json_object *not_found_list = json_object_new_array();
+    json_object *error_list = json_object_new_array();
+    
+    int file_changed = 0;
+    
+    // Process each domain
+    for (int i = 0; i < domains_count; i++) {
+        json_object *domain_item = json_object_array_get_idx(domains_obj, i);
+        
+        if (!json_object_is_type(domain_item, json_type_string)) {
+            // Add to error list for invalid format
+            json_object_object_add(error_list, "invalid_format", json_object_new_int(
+                json_object_get_int(json_object_object_get(error_list, "invalid_format")) + 1
+            ));
+            continue;
+        }
+        
+        const char *domain = json_object_get_string(domain_item);
+        
+        // Validate domain
+        if (strlen(domain) == 0 || strcspn(domain, " \t\n\r") != strlen(domain)) {
+            json_object_array_add(error_list, json_object_new_string(domain));
+            continue;
+        }
+        
+        // Check if domain exists in current blacklist
+        int domain_found = 0;
+        int domain_line = -1;
+        for (int j = 0; j < line_count; j++) {
+            if (strcasecmp(lines[j], domain) == 0) {
+                domain_found = 1;
+                domain_line = j;
+                break;
+            }
+        }
+        
+        if (strcmp(action, "add") == 0) {
+            if (domain_found) {
+                // Domain already exists
+                json_object_array_add(exists_list, json_object_new_string(domain));
+            } else {
+                // Add domain
+                if (line_count < 1000) {
+                    strncpy(lines[line_count], domain, sizeof(lines[0]) - 1);
+                    lines[line_count][sizeof(lines[0]) - 1] = '\0';
+                    line_count++;
+                    file_changed = 1;
+                    json_object_array_add(added_list, json_object_new_string(domain));
+                } else {
+                    json_object_array_add(error_list, json_object_new_string(domain));
+                }
+            }
+        } 
+        else { // remove action
+            if (domain_found) {
+                // Remove domain
+                for (int j = domain_line; j < line_count - 1; j++) {
+                    strcpy(lines[j], lines[j + 1]);
+                }
+                line_count--;
+                file_changed = 1;
+                json_object_array_add(removed_list, json_object_new_string(domain));
+            } else {
+                json_object_array_add(not_found_list, json_object_new_string(domain));
+            }
+        }
+    }
+    
+    // Write back to file if changes were made
+    if (file_changed) {
+        file = fopen(blacklist_path, "w");
+        if (!file) {
+            json_object_object_add(response_obj, "status", json_object_new_string("error"));
+            json_object_object_add(response_obj, "message", json_object_new_string("Cannot write to blacklist file"));
+        } else {
+            for (int i = 0; i < line_count; i++) {
+                fprintf(file, "%s\n", lines[i]);
+            }
+            fclose(file);
+            
+            // Restart 3proxy service
+            int restart_result = system("service 3proxy restart");
+            if (restart_result == 0) {
+                json_object_object_add(response_obj, "service_restart", json_object_new_string("success"));
+            } else {
+                json_object_object_add(response_obj, "service_restart", json_object_new_string("failed"));
+            }
+        }
+    }
+    
+    // Build response message based on action and results
+    char message[512];
+    if (strcmp(action, "add") == 0) {
+        int added_count = json_object_array_length(added_list);
+        int exists_count = json_object_array_length(exists_list);
+        int error_count = json_object_array_length(error_list);
+        
+        if (added_count > 0 && exists_count > 0) {
+            snprintf(message, sizeof(message), 
+                     "Added %d new domains, %d domains already existed", 
+                     added_count, exists_count);
+        } else if (added_count > 0) {
+            snprintf(message, sizeof(message), 
+                     "Successfully added %d new domains", added_count);
+        } else if (exists_count > 0) {
+            snprintf(message, sizeof(message), 
+                     "All %d domains already exist in blacklist", exists_count);
+        } else {
+            snprintf(message, sizeof(message), 
+                     "No domains were added");
+        }
+        
+        if (error_count > 0) {
+            char error_msg[256];
+            snprintf(error_msg, sizeof(error_msg), 
+                     ", %d domains had errors", error_count);
+            strncat(message, error_msg, sizeof(message) - strlen(message) - 1);
+        }
+    } 
+    else { // remove action
+        int removed_count = json_object_array_length(removed_list);
+        int not_found_count = json_object_array_length(not_found_list);
+        int error_count = json_object_array_length(error_list);
+        
+        if (removed_count > 0 && not_found_count > 0) {
+            snprintf(message, sizeof(message), 
+                     "Removed %d domains, %d domains not found", 
+                     removed_count, not_found_count);
+        } else if (removed_count > 0) {
+            snprintf(message, sizeof(message), 
+                     "Successfully removed %d domains", removed_count);
+        } else if (not_found_count > 0) {
+            snprintf(message, sizeof(message), 
+                     "None of the %d domains were found in blacklist", not_found_count);
+        } else {
+            snprintf(message, sizeof(message), 
+                     "No domains were removed");
+        }
+        
+        if (error_count > 0) {
+            char error_msg[256];
+            snprintf(error_msg, sizeof(error_msg), 
+                     ", %d domains had errors", error_count);
+            strncat(message, error_msg, sizeof(message) - strlen(message) - 1);
+        }
+    }
+    
+    // Add all lists to response
+    json_object_object_add(response_obj, "status", json_object_new_string("success"));
+    json_object_object_add(response_obj, "message", json_object_new_string(message));
+    json_object_object_add(response_obj, "action", json_object_new_string(action));
+    
+    if (strcmp(action, "add") == 0) {
+        json_object_object_add(response_obj, "added_list", added_list);
+        json_object_object_add(response_obj, "exists_list", exists_list);
+        json_object_object_add(response_obj, "added_count", json_object_new_int(json_object_array_length(added_list)));
+        json_object_object_add(response_obj, "exists_count", json_object_new_int(json_object_array_length(exists_list)));
+    } else {
+        json_object_object_add(response_obj, "removed_list", removed_list);
+        json_object_object_add(response_obj, "not_found_list", not_found_list);
+        json_object_object_add(response_obj, "removed_count", json_object_new_int(json_object_array_length(removed_list)));
+        json_object_object_add(response_obj, "not_found_count", json_object_new_int(json_object_array_length(not_found_list)));
+    }
+    
+    int error_count = json_object_array_length(error_list);
+    if (error_count > 0) {
+        json_object_object_add(response_obj, "error_list", error_list);
+        json_object_object_add(response_obj, "error_count", json_object_new_int(error_count));
+    } else {
+        json_object_put(error_list);
+    }
+    
+    json_object_object_add(response_obj, "file_updated", json_object_new_boolean(file_changed));
+    json_object_object_add(response_obj, "total_processed", json_object_new_int(domains_count));
+    
+    const char *response_str = json_object_to_json_string(response_obj);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    
+    // Cleanup
+    json_object_put(response_obj);
+    json_object_put(root);
+}
+
 // HTTP server event handler function
 static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_MSG) {
@@ -3167,7 +3430,7 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           mg_http_reply(c, 500, "", "{\"%m\":\"%m\"}\n", MG_ESC("error"), MG_ESC("Syntax Error")); 
         }
       }
-      else if( mg_match(hm->uri, mg_str("/resource-usage"), NULL) ) {
+      else if( mg_match(hm->uri, mg_str("/resource-status"), NULL) ) {
         char disk_str[32], cpu_str[32], memory_str[32];
     
         snprintf(disk_str, sizeof(disk_str), "%.2f%%", disk_usage);
@@ -3208,6 +3471,53 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
         mg_http_reply(c, 200, "", "%s\n", json_string);
         free(json_string);
+      }
+      else if( mg_match(hm->uri, mg_str("/blacklist"), NULL) ) {
+          // Handle blacklist query
+          const char *blacklist_path = "/usr/local/3proxy/conf/blacklist.txt";
+          
+          // Check if file exists
+          FILE *file = fopen(blacklist_path, "r");
+          if (!file) {
+              mg_http_reply(c, 404, "Content-Type: application/json\r\n", 
+                           "{\"error\": \"Blacklist file not found\"}");
+              return;
+          }
+          
+          // Create JSON array for blacklist entries
+          struct json_object *root = json_object_new_object();
+          struct json_object *entries_array = json_object_new_array();
+          
+          char line[256];
+          int line_count = 0;
+          
+          // Read blacklist file line by line
+          while (fgets(line, sizeof(line), file)) {
+              // Remove trailing newline
+              line[strcspn(line, "\n")] = 0;
+              
+              // Skip empty lines and comments
+              if (strlen(line) == 0 || line[0] == '#') {
+                  continue;
+              }
+              
+              // Add entry to JSON array
+              json_object_array_add(entries_array, json_object_new_string(line));
+              line_count++;
+          }
+          
+          fclose(file);
+          
+          // Add array to root object
+          json_object_object_add(root, "blacklist_entries", entries_array);
+          json_object_object_add(root, "total_entries", json_object_new_int(line_count));
+          
+          // Convert to JSON string and send response
+          const char *json_str = json_object_to_json_string(root);
+          mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s\n", json_str);
+          
+          // Clean up
+          json_object_put(root);
       }
       else if( mg_match(hm->uri, mg_str("/ping"), NULL) ) {
         char query[256], clientip[MAX_IP_LENGTH];
@@ -3296,6 +3606,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         handle_add_ipv6_address(c, hm);
         return;
       }
+      else if (mg_match(hm->uri, mg_str("/update-blacklist"), NULL)) {
+        handle_blacklist_post(c, hm);
+        return;
+      }
       else {
         goto send_errmsg;
       }
@@ -3357,12 +3671,6 @@ int main(int argc, char* argv[])
   if(set_sighandler(sig_usr_un))
   	return -1;
 
-  /*int rc = pthread_create(&thread_id, NULL, api_thread_function, NULL);
-  if (rc != 0) {
-      fprintf(stderr, "Error creating thread: %d\n", rc);
-      return EXIT_FAILURE;
-  }*/
-
   int rc = pthread_create(&resource_thread, NULL, resource_usage_thread, NULL);
   if (rc != 0) {
       fprintf(stderr, "Error creating thread: %d\n", rc);
@@ -3377,22 +3685,6 @@ int main(int argc, char* argv[])
   }
 
   printf("Main thread: Waiting for new thread to finish...\n");
-
-  // Wait for the thread to complete
-  /*rc = pthread_join(thread_id, NULL);
-  if (rc != 0) {
-      fprintf(stderr, "Error joining thread: %d\n", rc);
-  }
-  
-  rc = pthread_join(cpu_thread, NULL);
-  if (rc != 0) {
-      fprintf(stderr, "Error joining thread: %d\n", rc);
-  }*/
-  
-  /*rc = pthread_join(mem_thread, NULL);
-  if (rc != 0) {
-      fprintf(stderr, "Error joining thread: %d\n", rc);
-  }*/
 
   return 0;
 }
