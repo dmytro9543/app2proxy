@@ -3103,7 +3103,7 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
   json_object_put(root);
 }
 
-void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) {
+static void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) {
     const char *blacklist_path = "/usr/local/3proxy/conf/blacklist.txt";
     
     // Parse JSON body
@@ -3158,7 +3158,7 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
         return;
     }
     
-    // Read current blacklist
+    // Read current blacklist - use dynamic allocation
     FILE *file = fopen(blacklist_path, "r");
     if (!file) {
         json_object_put(root);
@@ -3167,12 +3167,53 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
         return;
     }
     
-    // Read all lines into memory
-    char lines[MAX_BLACKLIST_LINES][256];
+    // Use linked list or dynamic array for blacklist lines
+    char **lines = NULL;
     int line_count = 0;
+    int capacity = 1000;
     
-    while (fgets(lines[line_count], sizeof(lines[0]), file) && line_count < MAX_BLACKLIST_LINES) {
-        lines[line_count][strcspn(lines[line_count], "\n")] = 0;
+    lines = malloc(capacity * sizeof(char*));
+    if (!lines) {
+        fclose(file);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), file) && line_count < MAX_BLACKLIST_LINES) {
+        // Remove newline
+        buffer[strcspn(buffer, "\n")] = 0;
+        
+        // Allocate memory for this line
+        if (line_count >= capacity) {
+            capacity *= 2;
+            char **new_lines = realloc(lines, capacity * sizeof(char*));
+            if (!new_lines) {
+                // Free allocated memory and exit
+                for (int i = 0; i < line_count; i++) free(lines[i]);
+                free(lines);
+                fclose(file);
+                json_object_put(root);
+                mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                              "{\"error\":\"Memory allocation failed\"}");
+                return;
+            }
+            lines = new_lines;
+        }
+        
+        lines[line_count] = strdup(buffer);
+        if (!lines[line_count]) {
+            // Free allocated memory and exit
+            for (int i = 0; i < line_count; i++) free(lines[i]);
+            free(lines);
+            fclose(file);
+            json_object_put(root);
+            mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                          "{\"error\":\"Memory allocation failed\"}");
+            return;
+        }
         line_count++;
     }
     fclose(file);
@@ -3192,10 +3233,7 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
         json_object *domain_item = json_object_array_get_idx(domains_obj, i);
         
         if (!json_object_is_type(domain_item, json_type_string)) {
-            // Add to error list for invalid format
-            json_object_object_add(error_list, "invalid_format", json_object_new_int(
-                json_object_get_int(json_object_object_get(error_list, "invalid_format")) + 1
-            ));
+            // Skip invalid domains
             continue;
         }
         
@@ -3224,12 +3262,15 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
                 json_object_array_add(exists_list, json_object_new_string(domain));
             } else {
                 // Add domain
-                if (line_count < 1000) {
-                    strncpy(lines[line_count], domain, sizeof(lines[0]) - 1);
-                    lines[line_count][sizeof(lines[0]) - 1] = '\0';
-                    line_count++;
-                    file_changed = 1;
-                    json_object_array_add(added_list, json_object_new_string(domain));
+                if (line_count < MAX_BLACKLIST_LINES) {
+                    lines[line_count] = strdup(domain);
+                    if (lines[line_count]) {
+                        line_count++;
+                        file_changed = 1;
+                        json_object_array_add(added_list, json_object_new_string(domain));
+                    } else {
+                        json_object_array_add(error_list, json_object_new_string(domain));
+                    }
                 } else {
                     json_object_array_add(error_list, json_object_new_string(domain));
                 }
@@ -3238,8 +3279,9 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
         else { // remove action
             if (domain_found) {
                 // Remove domain
+                free(lines[domain_line]);
                 for (int j = domain_line; j < line_count - 1; j++) {
-                    strcpy(lines[j], lines[j + 1]);
+                    lines[j] = lines[j + 1];
                 }
                 line_count--;
                 file_changed = 1;
@@ -3269,7 +3311,11 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
             } else {
                 json_object_object_add(response_obj, "service_restart", json_object_new_string("failed"));
             }
+            
+            json_object_object_add(response_obj, "status", json_object_new_string("success"));
         }
+    } else {
+        json_object_object_add(response_obj, "status", json_object_new_string("success"));
     }
     
     // Build response message based on action and results
@@ -3330,7 +3376,6 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
     }
     
     // Add all lists to response
-    json_object_object_add(response_obj, "status", json_object_new_string("success"));
     json_object_object_add(response_obj, "message", json_object_new_string(message));
     json_object_object_add(response_obj, "action", json_object_new_string(action));
     
@@ -3360,7 +3405,11 @@ void handle_blacklist_post(struct mg_connection *c, struct mg_http_message *hm) 
     const char *response_str = json_object_to_json_string(response_obj);
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
     
-    // Cleanup
+    // Cleanup allocated memory
+    for (int i = 0; i < line_count; i++) {
+        free(lines[i]);
+    }
+    free(lines);
     json_object_put(response_obj);
     json_object_put(root);
 }

@@ -1,0 +1,15 @@
+{
+    "ents": {
+        "@lhandle_add_ipv6_address@p@l./main.c": [
+            {
+                "author": "COOL",
+                "body": "",
+                "created": "2025-10-22T08:20:47.876Z",
+                "lastmodified": "Wed Oct 22 08:20:47 2025 GMT",
+                "line": "0",
+                "lineContext": "static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_message *hm) {",
+                "machineid": "7388964F0CC165954446D2E2E2C1B802012602"
+            }
+        ]
+    }
+}
