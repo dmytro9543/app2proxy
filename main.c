@@ -12,6 +12,9 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <json-c/json.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "mongoose.h"
 
@@ -28,7 +31,9 @@
 
 #define CONFIG_PATH "/etc/3proxy/3proxy.cfg"
 
-#define VERSION_STRING "1.2.0"
+#define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
+
+#define VERSION_STRING "1.3.1"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -1767,41 +1772,6 @@ static void handle_delete_proxies(struct mg_connection *c, struct mg_http_messag
     printf("=== Delete proxies handler finished ===\n");
 }
 
-// Function to add IPv6 address to interface
-static int add_ipv6_to_interface(const char *ipv6_address, const char *interface, char *error_str, size_t error_size) {
-    char command[256];
-    
-    snprintf(command, sizeof(command), "ip -6 addr add %s/128 dev %s 2>&1", ipv6_address, interface);
-    
-    FILE *fp = popen(command, "r");
-    if (fp == NULL) {
-        snprintf(error_str, error_size, "Failed to execute command");
-        return -1;
-    }
-    
-    // Read the command output (including errors)
-    char output[1024] = {0};
-    size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
-    output[bytes_read] = '\0';
-    
-    int result = pclose(fp);
-    
-    // Copy output to error string (will contain error message if command failed)
-    strncpy(error_str, output, error_size - 1);
-    error_str[error_size - 1] = '\0';
-
-    if(!strlen(error_str)) {
-        snprintf(error_str, error_size, "Success");
-    } else if( strstr(error_str, "exists") ) {
-        snprintf(error_str, error_size, "Address exists");
-    }
-    
-    printf("IPv6 add result: %s, exit code: %d\n", command, result);
-    printf("Output: %s\n", output);
-    
-    return (result == 0);
-}
-
 // Function to read existing 3proxy configuration
 static char* read_3proxy_config() {
     printf("Config path: %s\n", CONFIG_PATH);
@@ -2998,7 +2968,51 @@ static void handle_ports_status(struct mg_connection *c, struct mg_http_message 
     json_object_put(root);
 }
 
-static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_message *hm) {
+// Function to add IP address to interface
+static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size) {
+    char command[256];
+    
+    if (is_ipv6) {
+        snprintf(command, sizeof(command), "ip -6 addr add %s/128 dev %s 2>&1", ip_address, interface);
+    } else {
+        snprintf(command, sizeof(command), "ip addr add %s dev %s 2>&1", ip_address, interface);
+    }
+    
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        snprintf(error_str, error_size, "Failed to execute command");
+        return -1;
+    }
+    
+    // Read the command output (including errors)
+    char output[1024] = {0};
+    size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
+    output[bytes_read] = '\0';
+    
+    int result = pclose(fp);
+    
+    // Copy output to error string (will contain error message if command failed)
+    strncpy(error_str, output, error_size - 1);
+    error_str[error_size - 1] = '\0';
+
+    if(!strlen(error_str)) {
+        snprintf(error_str, error_size, "Success");
+    } else if( strstr(error_str, "exists") ) {
+        snprintf(error_str, error_size, "Address exists");
+    }
+    
+    printf("IP add result: %s, exit code: %d\n", command, result);
+    printf("Output: %s\n", output);
+    
+    return (result == 0);
+}
+
+// Helper function to detect if an address is IPv6
+static int is_ipv6_address(const char *address) {
+    return strchr(address, ':') != NULL;
+}
+
+static void handle_add_ip_address(struct mg_connection *c, struct mg_http_message *hm) {
   // Parse JSON body
   char *body_str = malloc(hm->body.len + 1);
   if (!body_str) {
@@ -3019,7 +3033,7 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
     return;
   }
   
-  // Extract IPv6 addresses array
+  // Extract IP addresses array
   json_object *addresses_obj;
   if (!json_object_object_get_ex(root, "addresses", &addresses_obj) || 
       !json_object_is_type(addresses_obj, json_type_array)) {
@@ -3034,7 +3048,7 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
   int success_count = 0;
   int total_addresses = json_object_array_length(addresses_obj);
   
-  // Process each IPv6 address
+  // Process each IP address
   for (int i = 0; i < total_addresses; i++) {
     json_object *address_item = json_object_array_get_idx(addresses_obj, i);
     
@@ -3060,17 +3074,23 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
       json_object *result_obj = json_object_new_object();
       json_object_object_add(result_obj, "interface", json_object_new_string(interface ? interface : "unknown"));
       json_object_object_add(result_obj, "address", json_object_new_string(address ? address : "unknown"));
+      json_object_object_add(result_obj, "type", json_object_new_string("unknown"));
       json_object_object_add(result_obj, "status", json_object_new_string("invalid_input"));
       json_object_array_add(response_array, result_obj);
       continue;
     }
 
+    // Detect IP version
+    int is_ipv6 = is_ipv6_address(address);
+    const char *ip_type = is_ipv6 ? "IPv6" : "IPv4";
+    
     char error_msg[256];
-    // Add the IPv6 address to the interface (using fixed /128 prefix length)
-    if (add_ipv6_to_interface(address, interface, error_msg, sizeof(error_msg))) {
+    // Add the IP address to the interface
+    if (add_ip_to_interface(address, interface, is_ipv6, error_msg, sizeof(error_msg))) {
       json_object *result_obj = json_object_new_object();
       json_object_object_add(result_obj, "interface", json_object_new_string(interface));
       json_object_object_add(result_obj, "address", json_object_new_string(address));
+      json_object_object_add(result_obj, "type", json_object_new_string(ip_type));
       json_object_object_add(result_obj, "status", json_object_new_string(error_msg));
       json_object_array_add(response_array, result_obj);
       success_count++;
@@ -3078,6 +3098,7 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
       json_object *result_obj = json_object_new_object();
       json_object_object_add(result_obj, "interface", json_object_new_string(interface));
       json_object_object_add(result_obj, "address", json_object_new_string(address));
+      json_object_object_add(result_obj, "type", json_object_new_string(ip_type));
       json_object_object_add(result_obj, "status", json_object_new_string(error_msg));
       json_object_array_add(response_array, result_obj);
     }
@@ -3088,10 +3109,10 @@ static void handle_add_ipv6_address(struct mg_connection *c, struct mg_http_mess
   json_object_object_add(response_root, "status", json_object_new_string(success_count > 0 ? "success" : "partial"));
   json_object_object_add(response_root, "message", 
                          json_object_new_string(success_count == total_addresses ? 
-                             "All IPv6 addresses added successfully" :
+                             "All IP addresses added successfully" :
                              success_count > 0 ?
-                             "Some IPv6 addresses added successfully" :
-                             "Failed to add IPv6 addresses"));
+                             "Some IP addresses added successfully" :
+                             "Failed to add IP addresses"));
   json_object_object_add(response_root, "added", json_object_new_int(success_count));
   json_object_object_add(response_root, "total", json_object_new_int(total_addresses));
   json_object_object_add(response_root, "results", response_array);
@@ -3414,11 +3435,189 @@ static void handle_blacklist_post(struct mg_connection *c, struct mg_http_messag
     json_object_put(root);
 }
 
+
+// Function to validate binary before installing
+static int validate_binary(const char *path) {
+    struct stat st;
+    
+    // Check if file exists
+    if (stat(path, &st) != 0) {
+        return 0;
+    }
+    
+    // Check if it's a regular file with reasonable size
+    if (!S_ISREG(st.st_mode) || st.st_size < 10000 || st.st_size > 100000000) {
+        return 0;
+    }
+    
+    return 1;
+}
+
+// Function to safely copy file
+static int copy_file(const char *src, const char *dst) {
+    int src_fd, dst_fd;
+    char buffer[8192];
+    ssize_t bytes;
+    
+    src_fd = open(src, O_RDONLY);
+    if (src_fd < 0) return 0;
+    
+    dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (dst_fd < 0) {
+        close(src_fd);
+        return 0;
+    }
+    
+    while ((bytes = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        if (write(dst_fd, buffer, bytes) != bytes) {
+            close(src_fd);
+            close(dst_fd);
+            return 0;
+        }
+    }
+    
+    close(src_fd);
+    close(dst_fd);
+    return (bytes == 0);
+}
+
+static void restart_service_fork() {
+    printf("Forking to restart service...\n");
+    
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child process
+        sleep(2);  // Wait for HTTP response to complete
+        execl("/bin/systemctl", "systemctl", "restart", "app2proxy", NULL);
+        // If execl fails, exit child
+        _exit(1);
+    } else if (pid > 0) {
+        // Parent process - continue normally
+        printf("Service restart initiated in child process %d\n", pid);
+    } else {
+        // Fork failed
+        printf("Fork failed, trying direct restart\n");
+        system("systemctl restart app2proxy");
+    }
+}
+
+// Update API handler
+static void handle_update(struct mg_connection *c, struct mg_http_message *hm) {
+    printf("Update request received\n");
+    int success = 0;
+    
+    // Create response object
+    json_object *response = json_object_new_object();
+    
+    // 3. Check content length
+    if (hm->body.len < 10000) {
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string("File too small"));
+        goto send_response;
+    }
+    
+    printf("processing %zu bytes\n", hm->body.len);
+    
+    // 4. Save uploaded binary to temporary file
+    const char *temp_path = "/tmp/app2proxy-update.tmp";
+    FILE *fp = fopen(temp_path, "wb");
+    if (!fp) {
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string("Cannot create temp file"));
+        goto send_response;
+    }
+    
+    size_t written = fwrite(hm->body.buf, 1, hm->body.len, fp);
+    fclose(fp);
+    
+    if (written != hm->body.len) {
+        remove(temp_path);
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string("Failed to write file"));
+        goto send_response;
+    }
+    
+    // 5. Validate the binary
+    if (!validate_binary(temp_path)) {
+        remove(temp_path);
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string("Invalid binary file"));
+        goto send_response;
+    }
+    
+    // 6. Set executable permissions
+    if (chmod(temp_path, 0755) != 0) {
+        remove(temp_path);
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string("Cannot set permissions"));
+        goto send_response;
+    }
+    
+     // 7. Create backup using install command
+    const char *backup_path = "/tmp/app2proxy-backup";
+    char backup_cmd[512];
+    snprintf(backup_cmd, sizeof(backup_cmd), "install -m 0755 -p %s %s", CURRENT_BINARY_PATH, backup_path);
+    
+    if (system(backup_cmd) != 0) {
+        remove(temp_path);
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string("Cannot create backup"));
+        goto send_response;
+    }
+    
+    printf("Backup created at %s\n", backup_path);
+    
+    // 8. Install new binary using install command
+    char install_cmd[512];
+    snprintf(install_cmd, sizeof(install_cmd), "install -m 0755 -p %s %s", temp_path, CURRENT_BINARY_PATH);
+    
+    if (system(install_cmd) != 0) {
+        // Restore backup if installation fails
+        char restore_cmd[512];
+        snprintf(restore_cmd, sizeof(restore_cmd), "install -m 0755 -p %s %s", backup_path, CURRENT_BINARY_PATH);
+        system(restore_cmd);
+        
+        remove(temp_path);
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string("Installation failed"));
+        goto send_response;
+    }
+    
+    // Cleanup
+    //remove(temp_path);
+    
+    printf("Update successful, scheduling restart...\n");
+
+    success = 1;
+    
+    // Success response
+    json_object_object_add(response, "status", json_object_new_string("success"));
+    json_object_object_add(response, "message", json_object_new_string("Update completed successfully"));
+    json_object_object_add(response, "backup", json_object_new_string(backup_path));
+    
+send_response:
+    const char *response_str = json_object_to_json_string(response);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    json_object_put(response);
+    
+    // Restart service if update was successful
+    if (success) {
+        printf("Restarting service...\n");
+        restart_service_fork();
+    }
+}
+
+// Add version endpoint
+static void handle_version(struct mg_connection *c, struct mg_http_message *hm) {
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
+                 "{\"service\":\"app2proxy\",\"version\":\"%s\",\"path\":\"/usr/bin/app2proxy\"}", VERSION_STRING);
+}
+
 // HTTP server event handler function
 static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_MSG) {
     struct mg_http_message *hm = (struct mg_http_message *) ev_data;
-    printf("method: "); printMg(&hm->method);
+    /*printf("method: "); printMg(&hm->method);
     printf("uir: "); printMg(&hm->uri);
     printf("query: "); printMg(&hm->query);
     printf("proto: "); printMg(&hm->proto);
@@ -3426,7 +3625,7 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     printf("headers.value: "); printMg(&hm->headers[0].value);
     printf("body: "); printMg(&hm->body);
     printf("head: "); printMg(&hm->head);
-    printf("message: "); printMg(&hm->message);
+    printf("message: "); printMg(&hm->message);*/
 
     if ( mg_match(hm->method, mg_str("GET"), NULL) ) {
       if( mg_match(hm->uri, mg_str("/traffic"), NULL) ) {
@@ -3593,6 +3792,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           mg_http_reply(c, 500, "", "{\"%m\":\"%m\"}\n", MG_ESC("error"), MG_ESC("Syntax Error")); 
         }
       }
+      else if (mg_match(hm->uri, mg_str("/version"), NULL)) {
+          handle_version(c, hm);
+          return;
+      }
       else {
         goto send_errmsg;
       }
@@ -3652,11 +3855,15 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         return;
       }
       else if (mg_match(hm->uri, mg_str("/load-ipv6"), NULL)) {
-        handle_add_ipv6_address(c, hm);
+        handle_add_ip_address(c, hm);
         return;
       }
       else if (mg_match(hm->uri, mg_str("/update-blacklist"), NULL)) {
         handle_blacklist_post(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/update"), NULL)) {
+        handle_update(c, hm);
         return;
       }
       else {
