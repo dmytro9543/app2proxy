@@ -68,6 +68,8 @@ bool is_ipv6(const char* ip);
 void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_delete_proxies(struct mg_connection *c, struct mg_http_message *hm);
+static void handle_proxy_ip(struct mg_connection *c, struct mg_http_message *hm);
+static int get_query_param(const struct mg_str *query, const char *key, char *value, size_t value_size);
 static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size);
 
 static void sig_usr_un(int signo)
@@ -301,6 +303,37 @@ static void parse_query(const char* query, char* ip, int* count)
             if (*count <= 0) *count = DEFAULT_COUNT;  // Validate count
         }
     }
+}
+
+// Extract a specific query parameter from an mg_str query string
+static int get_query_param(const struct mg_str *query, const char *key, char *value, size_t value_size) {
+    if (!query || !query->buf || query->len == 0 || !key || !value || value_size == 0) {
+        return 0;
+    }
+
+    char *query_copy = malloc(query->len + 1);
+    if (!query_copy) {
+        return 0;
+    }
+    memcpy(query_copy, query->buf, query->len);
+    query_copy[query->len] = '\0';
+
+    size_t key_len = strlen(key);
+    char *saveptr = NULL;
+    char *token = strtok_r(query_copy, "&", &saveptr);
+
+    while (token) {
+        if (strncmp(token, key, key_len) == 0 && token[key_len] == '=') {
+            strncpy(value, token + key_len + 1, value_size - 1);
+            value[value_size - 1] = '\0';
+            free(query_copy);
+            return 1;
+        }
+        token = strtok_r(NULL, "&", &saveptr);
+    }
+
+    free(query_copy);
+    return 0;
 }
 
 static char* convert_to_valid_json(const char* input) {
@@ -1902,6 +1935,86 @@ static char* read_3proxy_config() {
     fclose(file);
     
     return content;
+}
+
+// Extract the external IP assigned to a specific proxy port from proxy/socks lines
+static char* find_proxy_ip_by_port(const char *config_content, int target_port) {
+    if (!config_content || target_port <= 0) {
+        return NULL;
+    }
+
+    const char *cursor = config_content;
+
+    while (*cursor) {
+        // Skip leading whitespace to align with directive start
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+
+        if (strncmp(cursor, "proxy", 5) == 0 || strncmp(cursor, "socks", 5) == 0) {
+            const char *line_end = strchr(cursor, '\n');
+            size_t line_len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+
+            char *line = malloc(line_len + 1);
+            if (!line) {
+                return NULL;
+            }
+            memcpy(line, cursor, line_len);
+            line[line_len] = '\0';
+
+            int found_port = -1;
+            char ip_candidate[256];
+            ip_candidate[0] = '\0';
+
+            char *saveptr = NULL;
+            char *token = strtok_r(line, " \t", &saveptr);
+            while (token) {
+                if (strcmp(token, "-p") == 0) {
+                    char *port_token = strtok_r(NULL, " \t", &saveptr);
+                    if (port_token) {
+                        char *endptr;
+                        long port_val = strtol(port_token, &endptr, 10);
+                        if (endptr != port_token && *endptr == '\0') {
+                            found_port = (int) port_val;
+                        }
+                    }
+                } else if (strncmp(token, "-p", 2) == 0 && token[2] != '\0') {
+                    char *endptr;
+                    long port_val = strtol(token + 2, &endptr, 10);
+                    if (endptr != token + 2 && *endptr == '\0') {
+                        found_port = (int) port_val;
+                    }
+                } else if (strcmp(token, "-e") == 0) {
+                    char *ip_token = strtok_r(NULL, " \t", &saveptr);
+                    if (ip_token && *ip_token) {
+                        strncpy(ip_candidate, ip_token, sizeof(ip_candidate) - 1);
+                        ip_candidate[sizeof(ip_candidate) - 1] = '\0';
+                    }
+                } else if (strncmp(token, "-e", 2) == 0 && token[2] != '\0') {
+                    strncpy(ip_candidate, token + 2, sizeof(ip_candidate) - 1);
+                    ip_candidate[sizeof(ip_candidate) - 1] = '\0';
+                }
+
+                token = strtok_r(NULL, " \t", &saveptr);
+            }
+
+            if (found_port == target_port && ip_candidate[0] != '\0') {
+                char *result = strdup(ip_candidate);
+                free(line);
+                return result;
+            }
+
+            free(line);
+        }
+
+        const char *next_line = strchr(cursor, '\n');
+        if (!next_line) {
+            break;
+        }
+        cursor = next_line + 1;
+    }
+
+    return NULL;
 }
 
 // Function to write 3proxy configuration
@@ -3714,6 +3827,78 @@ send_response:
     }
 }
 
+// Return the current external proxy IP defined in 3proxy.cfg
+static void handle_proxy_ip(struct mg_connection *c, struct mg_http_message *hm) {
+    if (hm->query.len == 0) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"port query parameter is required\"}");
+        return;
+    }
+
+    char *query = malloc(hm->query.len + 1);
+    if (!query) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Failed to allocate memory for query parsing\"}");
+        return;
+    }
+
+    memcpy(query, hm->query.buf, hm->query.len);
+    query[hm->query.len] = '\0';
+
+    int target_port = -1;
+    char *token;
+    char *rest = query;
+    while ((token = strtok_r(rest, "&", &rest))) {
+        if (strncmp(token, "port=", 5) == 0) {
+            char *port_value = token + 5;
+            if (*port_value == '\0') {
+                continue;
+            }
+
+            char *endptr;
+            long port_long = strtol(port_value, &endptr, 10);
+            if (endptr == port_value || *endptr != '\0' || port_long <= 0 || port_long > 65535) {
+                break;
+            }
+            target_port = (int) port_long;
+            break;
+        }
+    }
+
+    free(query);
+
+    if (target_port <= 0) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Invalid or missing port parameter\"}");
+        return;
+    }
+
+    char *config_content = read_3proxy_config();
+    if (!config_content) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Unable to read 3proxy configuration\"}");
+        return;
+    }
+
+    char *proxy_ip = find_proxy_ip_by_port(config_content, target_port);
+    free(config_content);
+
+    if (!proxy_ip) {
+        mg_http_reply(c, 404, "Content-Type: application/json\r\n",
+                      "{\"error\":\"No proxy entry found for the requested port\"}");
+        return;
+    }
+
+    json_object *response = json_object_new_object();
+    json_object_object_add(response, "port", json_object_new_int(target_port));
+    json_object_object_add(response, "proxy_ip", json_object_new_string(proxy_ip));
+    free(proxy_ip);
+
+    const char *response_str = json_object_to_json_string(response);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    json_object_put(response);
+}
+
 // Add version endpoint
 static void handle_version(struct mg_connection *c, struct mg_http_message *hm) {
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
@@ -3873,6 +4058,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           
           // Clean up
           json_object_put(root);
+      }
+      else if (mg_match(hm->uri, mg_str("/proxy-ip"), NULL)) {
+          handle_proxy_ip(c, hm);
+          return;
       }
       else if( mg_match(hm->uri, mg_str("/ping"), NULL) ) {
         char query[256], clientip[MAX_IP_LENGTH];
