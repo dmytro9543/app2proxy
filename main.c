@@ -69,6 +69,7 @@ void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_delete_proxies(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_proxy_ip(struct mg_connection *c, struct mg_http_message *hm);
+static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_message *hm);
 static int get_query_param(const struct mg_str *query, const char *key, char *value, size_t value_size);
 static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size);
 
@@ -1937,6 +1938,95 @@ static char* read_3proxy_config() {
     return content;
 }
 
+static int ensure_buffer_capacity(char **buffer, size_t *capacity, size_t required) {
+    if (*capacity >= required) {
+        return 1;
+    }
+
+    size_t new_capacity = (*capacity == 0) ? 1024 : *capacity;
+    while (new_capacity < required) {
+        new_capacity *= 2;
+    }
+
+    char *new_buffer = realloc(*buffer, new_capacity);
+    if (!new_buffer) {
+        return 0;
+    }
+
+    *buffer = new_buffer;
+    *capacity = new_capacity;
+    return 1;
+}
+
+static int append_line_to_buffer(char **buffer, size_t *capacity, size_t *length,
+                                 const char *line, size_t line_len, int add_newline) {
+    size_t required = *length + line_len + (add_newline ? 1 : 0) + 1;
+    if (!ensure_buffer_capacity(buffer, capacity, required)) {
+        return 0;
+    }
+
+    memcpy(*buffer + *length, line, line_len);
+    *length += line_len;
+
+    if (add_newline) {
+        (*buffer)[(*length)++] = '\n';
+    }
+
+    (*buffer)[*length] = '\0';
+    return 1;
+}
+
+static char* rebuild_proxy_line_with_ip(const char *line, const char *new_ip) {
+    size_t buffer_size = strlen(line) + strlen(new_ip) + 32;
+    char *rebuilt = malloc(buffer_size);
+    if (!rebuilt) {
+        return NULL;
+    }
+    rebuilt[0] = '\0';
+
+    char *line_copy = strdup(line);
+    if (!line_copy) {
+        free(rebuilt);
+        return NULL;
+    }
+
+    char *token;
+    char *saveptr = NULL;
+    int replaced = 0;
+    int first_token = 1;
+
+    while ((token = strtok_r(first_token ? line_copy : NULL, " \t", &saveptr))) {
+        first_token = 0;
+
+        if (strcmp(token, "-e") == 0) {
+            if (rebuilt[0] != '\0') strcat(rebuilt, " ");
+            strcat(rebuilt, "-e ");
+            strcat(rebuilt, new_ip);
+            replaced = 1;
+            strtok_r(NULL, " \t", &saveptr);  // Skip original IP token
+            continue;
+        } else if (strncmp(token, "-e", 2) == 0 && token[2] != '\0') {
+            if (rebuilt[0] != '\0') strcat(rebuilt, " ");
+            strcat(rebuilt, "-e ");
+            strcat(rebuilt, new_ip);
+            replaced = 1;
+            continue;
+        }
+
+        if (rebuilt[0] != '\0') strcat(rebuilt, " ");
+        strcat(rebuilt, token);
+    }
+
+    if (!replaced) {
+        if (rebuilt[0] != '\0') strcat(rebuilt, " ");
+        strcat(rebuilt, "-e ");
+        strcat(rebuilt, new_ip);
+    }
+
+    free(line_copy);
+    return rebuilt;
+}
+
 // Extract the external IP assigned to a specific proxy port from proxy/socks lines
 static char* find_proxy_ip_by_port(const char *config_content, int target_port) {
     if (!config_content || target_port <= 0) {
@@ -2015,6 +2105,123 @@ static char* find_proxy_ip_by_port(const char *config_content, int target_port) 
     }
 
     return NULL;
+}
+
+// Update the external IP for the proxy/socks line matching the provided port.
+// Returns a newly allocated config string on success, NULL on failure.
+// The status output parameter is set to:
+//   1  -> update performed
+//   0  -> target port not found
+//  -1  -> error occurred
+static char* update_proxy_ip_in_config(const char *config_content, int target_port,
+                                       const char *new_ip, int *status) {
+    if (status) *status = -1;
+    if (!config_content || target_port <= 0 || !new_ip) {
+        return NULL;
+    }
+
+    size_t config_len = strlen(config_content);
+    size_t buffer_capacity = config_len + strlen(new_ip) + 256;
+    char *result = malloc(buffer_capacity);
+    if (!result) {
+        return NULL;
+    }
+    result[0] = '\0';
+    size_t result_len = 0;
+
+    const char *cursor = config_content;
+    int updated = 0;
+
+    while (*cursor) {
+        const char *line_end = strchr(cursor, '\n');
+        size_t line_len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+
+        char *line = malloc(line_len + 1);
+        if (!line) {
+            free(result);
+            return NULL;
+        }
+        memcpy(line, cursor, line_len);
+        line[line_len] = '\0';
+
+        char *processed_line = line;
+
+        if (strncmp(line, "proxy", 5) == 0 || strncmp(line, "socks", 5) == 0) {
+            char *line_copy = strdup(line);
+            if (!line_copy) {
+                free(line);
+                free(result);
+                return NULL;
+            }
+
+            char *token;
+            char *saveptr = NULL;
+            int first_token = 1;
+            int found_port = -1;
+
+            while ((token = strtok_r(first_token ? line_copy : NULL, " \t", &saveptr))) {
+                first_token = 0;
+                if (strcmp(token, "-p") == 0) {
+                    char *port_token = strtok_r(NULL, " \t", &saveptr);
+                    if (port_token) {
+                        char *endptr;
+                        long port_val = strtol(port_token, &endptr, 10);
+                        if (endptr != port_token && *endptr == '\0') {
+                            found_port = (int) port_val;
+                            break;
+                        }
+                    }
+                } else if (strncmp(token, "-p", 2) == 0 && token[2] != '\0') {
+                    char *endptr;
+                    long port_val = strtol(token + 2, &endptr, 10);
+                    if (endptr != token + 2 && *endptr == '\0') {
+                        found_port = (int) port_val;
+                        break;
+                    }
+                }
+            }
+
+            free(line_copy);
+
+            if (found_port == target_port) {
+                char *rebuilt = rebuild_proxy_line_with_ip(line, new_ip);
+                if (!rebuilt) {
+                    free(line);
+                    free(result);
+                    return NULL;
+                }
+                free(line);
+                processed_line = rebuilt;
+                updated = 1;
+            }
+        }
+
+        if (!append_line_to_buffer(&result, &buffer_capacity, &result_len,
+                                   processed_line, strlen(processed_line),
+                                   line_end != NULL)) {
+            if (processed_line != line) free(processed_line);
+            else free(line);
+            free(result);
+            return NULL;
+        }
+
+        if (processed_line != line) {
+            free(processed_line);
+        } else {
+            free(line);
+        }
+
+        cursor = line_end ? line_end + 1 : cursor + line_len;
+    }
+
+    if (!updated) {
+        free(result);
+        if (status) *status = 0;
+        return NULL;
+    }
+
+    if (status) *status = 1;
+    return result;
 }
 
 // Function to write 3proxy configuration
@@ -3899,6 +4106,126 @@ static void handle_proxy_ip(struct mg_connection *c, struct mg_http_message *hm)
     json_object_put(response);
 }
 
+// Update the external proxy IP bound to a specific port
+static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_message *hm) {
+    if (hm->body.len == 0) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"JSON body with port and ip is required\"}");
+        return;
+    }
+
+    char *body = malloc(hm->body.len + 1);
+    if (!body) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Failed to allocate memory for request body\"}");
+        return;
+    }
+    memcpy(body, hm->body.buf, hm->body.len);
+    body[hm->body.len] = '\0';
+
+    json_object *root = json_tokener_parse(body);
+    free(body);
+
+    if (!root || !json_object_is_type(root, json_type_object)) {
+        if (root) json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Invalid JSON payload\"}");
+        return;
+    }
+
+    json_object *port_obj = NULL;
+    json_object *ip_obj = NULL;
+
+    if (!json_object_object_get_ex(root, "port", &port_obj) ||
+        !json_object_is_type(port_obj, json_type_int)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Field 'port' (integer) is required\"}");
+        return;
+    }
+
+    if (!json_object_object_get_ex(root, "ip", &ip_obj) ||
+        !json_object_is_type(ip_obj, json_type_string)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Field 'ip' (string) is required\"}");
+        return;
+    }
+
+    int target_port = json_object_get_int(port_obj);
+    const char *new_ip = json_object_get_string(ip_obj);
+
+    if (target_port <= 0 || target_port > 65535) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Port must be between 1 and 65535\"}");
+        return;
+    }
+
+    if (!new_ip || strlen(new_ip) == 0 || strlen(new_ip) >= 256) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Invalid IP field\"}");
+        return;
+    }
+
+    if (!is_ipv4(new_ip) && !is_ipv6(new_ip)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"IP must be valid IPv4 or IPv6\"}");
+        return;
+    }
+
+    char *config_content = read_3proxy_config();
+    if (!config_content) {
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Unable to read 3proxy configuration\"}");
+        return;
+    }
+
+    int update_status = -1;
+    char *updated_config = update_proxy_ip_in_config(config_content, target_port, new_ip, &update_status);
+    free(config_content);
+
+    if (update_status == 0) {
+        json_object_put(root);
+        mg_http_reply(c, 404, "Content-Type: application/json\r\n",
+                      "{\"error\":\"No proxy entry found for the requested port\"}");
+        return;
+    } else if (update_status < 0 || !updated_config) {
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Failed to process configuration\"}");
+        return;
+    }
+
+    int write_result = write_3proxy_config(updated_config);
+    free(updated_config);
+
+    if (!write_result) {
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Failed to write updated configuration\"}");
+        return;
+    }
+
+    int restart_result = restart_3proxy_service();
+
+    json_object *response = json_object_new_object();
+    json_object_object_add(response, "status", json_object_new_string("success"));
+    json_object_object_add(response, "port", json_object_new_int(target_port));
+    json_object_object_add(response, "ip", json_object_new_string(new_ip));
+    json_object_object_add(response, "service_restart",
+                           json_object_new_string(restart_result == 0 ? "ok" : "failed"));
+
+    const char *response_str = json_object_to_json_string(response);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+
+    json_object_put(response);
+    json_object_put(root);
+}
+
 // Add version endpoint
 static void handle_version(struct mg_connection *c, struct mg_http_message *hm) {
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
@@ -4148,6 +4475,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       }
       else if (mg_match(hm->uri, mg_str("/ports-status"), NULL)) {
         handle_ports_status(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/change-proxy-ip"), NULL)) {
+        handle_update_proxy_ip(c, hm);
         return;
       }
       else if (mg_match(hm->uri, mg_str("/load-ipv6"), NULL)) {
