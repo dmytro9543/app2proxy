@@ -2000,14 +2000,14 @@ static char* rebuild_proxy_line_with_ip(const char *line, const char *new_ip) {
 
         if (strcmp(token, "-e") == 0) {
             if (rebuilt[0] != '\0') strcat(rebuilt, " ");
-            strcat(rebuilt, "-e ");
+            strcat(rebuilt, "-e");
             strcat(rebuilt, new_ip);
             replaced = 1;
             strtok_r(NULL, " \t", &saveptr);  // Skip original IP token
             continue;
         } else if (strncmp(token, "-e", 2) == 0 && token[2] != '\0') {
             if (rebuilt[0] != '\0') strcat(rebuilt, " ");
-            strcat(rebuilt, "-e ");
+            strcat(rebuilt, "-e");
             strcat(rebuilt, new_ip);
             replaced = 1;
             continue;
@@ -2019,7 +2019,7 @@ static char* rebuild_proxy_line_with_ip(const char *line, const char *new_ip) {
 
     if (!replaced) {
         if (rebuilt[0] != '\0') strcat(rebuilt, " ");
-        strcat(rebuilt, "-e ");
+        strcat(rebuilt, "-e");
         strcat(rebuilt, new_ip);
     }
 
@@ -4226,6 +4226,128 @@ static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_messa
     json_object_put(root);
 }
 
+// Single command execution endpoint: POST /run-cmd
+// Body: { "cmd": "service 3proxy restart" }
+// Returns: { "cmd": "...", "exit_code": <int>, "output": "..." }
+static char* run_command_capture(const char *command, int *exit_code) {
+    if (exit_code) *exit_code = -1;
+    if (!command) return NULL;
+
+    printf("run-cmd: %s\n", command);
+
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        return strdup("Failed to execute command");
+    }
+
+    size_t cap = 1024, len = 0;
+    char *out = (char*) malloc(cap);
+    if (!out) {
+        pclose(fp);
+        return strdup("Memory allocation failed");
+    }
+    out[0] = '\0';
+
+    char buf[256];
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        size_t add = strlen(buf);
+        if (len + add + 1 > cap) {
+            size_t ncap = cap * 2;
+            while (len + add + 1 > ncap) ncap *= 2;
+            char *tmp = (char*) realloc(out, ncap);
+            if (!tmp) { free(out); pclose(fp); return strdup("Memory allocation failed"); }
+            out = tmp; cap = ncap;
+        }
+        memcpy(out + len, buf, add);
+        len += add; out[len] = '\0';
+    }
+    int status = pclose(fp);
+    if (exit_code) *exit_code = status;
+    return out;
+}
+
+// Allowlist basic safety: only permit `service 3proxy ...` and `systemctl ... 3proxy`
+static int is_command_allowed(const char *cmd) {
+    if (!cmd) return 0;
+    // Trim leading spaces
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    if (strncmp(cmd, "service ", 8) == 0) return 1;
+    if (strncmp(cmd, "systemctl ", 10) == 0) return 1;
+    if (strncmp(cmd, "pidof ", 6) == 0) return 1;
+    return 0;
+}
+
+static void handle_run_command(struct mg_connection *c, struct mg_http_message *hm) {
+    if (hm->body.len == 0) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"JSON body required with 'cmd'\"}");
+        return;
+    }
+
+    char *body = (char*) malloc(hm->body.len + 1);
+    if (!body) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    memcpy(body, hm->body.buf, hm->body.len); body[hm->body.len] = '\0';
+    json_object *root = json_tokener_parse(body);
+    free(body);
+
+    if (!root || !json_object_is_type(root, json_type_object)) {
+        if (root) json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+
+    json_object *cmd_obj = NULL;
+    if (!json_object_object_get_ex(root, "cmd", &cmd_obj) || !json_object_is_type(cmd_obj, json_type_string)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Field 'cmd' (string) is required\"}");
+        return;
+    }
+
+    const char *cmd = json_object_get_string(cmd_obj);
+
+    if (!is_command_allowed(cmd)) {
+        json_object_put(root);
+        mg_http_reply(c, 403, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Command not allowed\"}");
+        return;
+    }
+
+    // Append stderr to stdout for complete output
+    char *fullcmd = NULL;
+    size_t flen = strlen(cmd) + 6;
+    fullcmd = (char*) malloc(flen);
+    if (!fullcmd) {
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    snprintf(fullcmd, flen, "%s 2>&1", cmd);
+
+    int exit_code = -1;
+    char *output = run_command_capture(fullcmd, &exit_code);
+    free(fullcmd);
+    json_object_put(root);
+
+    // Build response
+    struct json_object *resp = json_object_new_object();
+    json_object_object_add(resp, "cmd", json_object_new_string(cmd));
+    json_object_object_add(resp, "exit_code", json_object_new_int(exit_code));
+    json_object_object_add(resp, "output", json_object_new_string(output ? output : ""));
+
+    const char *resp_str = json_object_to_json_string(resp);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", resp_str);
+
+    if (output) free(output);
+    json_object_put(resp);
+}
+
 // Add version endpoint
 static void handle_version(struct mg_connection *c, struct mg_http_message *hm) {
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
@@ -4479,6 +4601,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       }
       else if (mg_match(hm->uri, mg_str("/change-proxy-ip"), NULL)) {
         handle_update_proxy_ip(c, hm);
+        return;
+      }
+      else if (mg_match(hm->uri, mg_str("/run-cmd"), NULL)) {
+        handle_run_command(c, hm);
         return;
       }
       else if (mg_match(hm->uri, mg_str("/load-ipv6"), NULL)) {
