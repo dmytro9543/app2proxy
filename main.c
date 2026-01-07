@@ -3395,6 +3395,72 @@ static void handle_ports_status(struct mg_connection *c, struct mg_http_message 
     json_object_put(root);
 }
 
+static int remove_ip_from_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size) {
+    char command[256];
+    
+    if (is_ipv6) {
+        // First try to remove with /128 prefix
+        snprintf(command, sizeof(command), "ip -6 addr del %s/128 dev %s 2>&1", ip_address, interface);
+    } else {
+        // For IPv4, we need to find the exact address with prefix
+        snprintf(command, sizeof(command), "ip addr show dev %s | grep 'inet %s/' | head -1 | awk '{print $2}'", 
+                interface, ip_address);
+        
+        FILE *fp = popen(command, "r");
+        if (fp) {
+            char full_ip[256] = {0};
+            if (fgets(full_ip, sizeof(full_ip), fp)) {
+                // Remove newline
+                full_ip[strcspn(full_ip, "\n")] = 0;
+                pclose(fp);
+                
+                if (strlen(full_ip) > 0) {
+                    snprintf(command, sizeof(command), "ip addr del %s dev %s 2>&1", full_ip, interface);
+                } else {
+                    // If no full IP found, try without prefix
+                    snprintf(command, sizeof(command), "ip addr del %s dev %s 2>&1", ip_address, interface);
+                }
+            } else {
+                pclose(fp);
+                snprintf(command, sizeof(command), "ip addr del %s dev %s 2>&1", ip_address, interface);
+            }
+        } else {
+            snprintf(command, sizeof(command), "ip addr del %s dev %s 2>&1", ip_address, interface);
+        }
+    }
+    
+    printf("Removing IP command: %s\n", command);
+    
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        snprintf(error_str, error_size, "Failed to execute remove command");
+        return -1;
+    }
+    
+    // Read the command output
+    char output[1024] = {0};
+    size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
+    output[bytes_read] = '\0';
+    
+    int result = pclose(fp);
+    
+    // Copy output to error string
+    strncpy(error_str, output, error_size - 1);
+    error_str[error_size - 1] = '\0';
+    
+    if (!strlen(error_str)) {
+        snprintf(error_str, error_size, "Success");
+    } else if (strstr(error_str, "Cannot assign") || strstr(error_str, "not found")) {
+        // IP might not exist on the interface, that's OK
+        snprintf(error_str, error_size, "IP not found or already removed");
+        return 0; // Treat as success
+    }
+    
+    printf("IP remove result: exit code: %d, output: %s\n", result, output);
+    
+    return (result == 0);
+}
+
 // Function to add IP address to interface
 static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size) {
     char command[256];
@@ -3432,6 +3498,51 @@ static int add_ip_to_interface(const char *ip_address, const char *interface, in
     printf("Output: %s\n", output);
     
     return (result == 0);
+}
+
+static int add_ip_to_interface_with_cleanup(const char *old_ip, const char *new_ip, 
+                                           const char *interface, char *error_str, size_t error_size) {
+    char error_msg[1024] = {0};
+    int success = 1;
+    
+    // Determine IP versions
+    int old_is_ipv6 = old_ip ? (strchr(old_ip, ':') != NULL) : 0;
+    int new_is_ipv6 = strchr(new_ip, ':') != NULL;
+    
+    // Step 1: Remove old IP if it exists
+    if (old_ip && strlen(old_ip) > 0) {
+        printf("Removing old IP: %s from interface: %s\n", old_ip, interface);
+        if (!remove_ip_from_interface(old_ip, interface, old_is_ipv6, error_msg, sizeof(error_msg))) {
+            snprintf(error_str, error_size, "Failed to remove old IP %s: %s", old_ip, error_msg);
+            success = 0;
+            // Continue anyway - we'll try to add the new IP
+        } else {
+            printf("Successfully removed old IP: %s\n", old_ip);
+        }
+    }
+    
+    // Step 2: Add new IP
+    printf("Adding new IP: %s to interface: %s\n", new_ip, interface);
+    if (!add_ip_to_interface(new_ip, interface, new_is_ipv6, error_msg, sizeof(error_msg))) {
+        if (success) {
+            // If we hadn't already failed
+            snprintf(error_str, error_size, "Failed to add new IP %s: %s", new_ip, error_msg);
+        } else {
+            // Append to existing error
+            strncat(error_str, "; Failed to add new IP: ", error_size - strlen(error_str) - 1);
+            strncat(error_str, error_msg, error_size - strlen(error_str) - 1);
+        }
+        return 0;
+    } else {
+        printf("Successfully added new IP: %s\n", new_ip);
+    }
+    
+    if (success) {
+        snprintf(error_str, error_size, "Success: Removed %s and added %s", 
+                old_ip ? old_ip : "nothing", new_ip);
+    }
+    
+    return success;
 }
 
 // Helper function to detect if an address is IPv6
@@ -4106,6 +4217,81 @@ static void handle_proxy_ip(struct mg_connection *c, struct mg_http_message *hm)
     json_object_put(response);
 }
 
+static char* find_old_ip_by_port(const char *config_content, int target_port) {
+    if (!config_content || target_port <= 0) {
+        return NULL;
+    }
+
+    const char *cursor = config_content;
+    
+    while (*cursor) {
+        // Look for proxy/socks lines
+        if (strncmp(cursor, "proxy", 5) == 0 || strncmp(cursor, "socks", 5) == 0) {
+            const char *line_end = strchr(cursor, '\n');
+            size_t line_len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+            
+            char *line = malloc(line_len + 1);
+            if (!line) {
+                return NULL;
+            }
+            memcpy(line, cursor, line_len);
+            line[line_len] = '\0';
+            
+            int found_port = -1;
+            char ip_candidate[256];
+            ip_candidate[0] = '\0';
+            
+            char *saveptr = NULL;
+            char *token = strtok_r(line, " \t", &saveptr);
+            while (token) {
+                if (strcmp(token, "-p") == 0) {
+                    char *port_token = strtok_r(NULL, " \t", &saveptr);
+                    if (port_token) {
+                        char *endptr;
+                        long port_val = strtol(port_token, &endptr, 10);
+                        if (endptr != port_token && *endptr == '\0') {
+                            found_port = (int) port_val;
+                        }
+                    }
+                } else if (strncmp(token, "-p", 2) == 0 && token[2] != '\0') {
+                    char *endptr;
+                    long port_val = strtol(token + 2, &endptr, 10);
+                    if (endptr != token + 2 && *endptr == '\0') {
+                        found_port = (int) port_val;
+                    }
+                } else if (strcmp(token, "-e") == 0) {
+                    char *ip_token = strtok_r(NULL, " \t", &saveptr);
+                    if (ip_token && *ip_token) {
+                        strncpy(ip_candidate, ip_token, sizeof(ip_candidate) - 1);
+                        ip_candidate[sizeof(ip_candidate) - 1] = '\0';
+                    }
+                } else if (strncmp(token, "-e", 2) == 0 && token[2] != '\0') {
+                    strncpy(ip_candidate, token + 2, sizeof(ip_candidate) - 1);
+                    ip_candidate[sizeof(ip_candidate) - 1] = '\0';
+                }
+                
+                token = strtok_r(NULL, " \t", &saveptr);
+            }
+            
+            if (found_port == target_port && ip_candidate[0] != '\0') {
+                char *result = strdup(ip_candidate);
+                free(line);
+                return result;
+            }
+            
+            free(line);
+        }
+        
+        const char *next_line = strchr(cursor, '\n');
+        if (!next_line) {
+            break;
+        }
+        cursor = next_line + 1;
+    }
+    
+    return NULL;
+}
+
 // Update the external proxy IP bound to a specific port
 static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_message *hm) {
     if (hm->body.len == 0) {
@@ -4135,6 +4321,7 @@ static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_messa
 
     json_object *port_obj = NULL;
     json_object *ip_obj = NULL;
+    json_object *interface_obj = NULL;
 
     if (!json_object_object_get_ex(root, "port", &port_obj) ||
         !json_object_is_type(port_obj, json_type_int)) {
@@ -4150,6 +4337,13 @@ static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_messa
         mg_http_reply(c, 400, "Content-Type: application/json\r\n",
                       "{\"error\":\"Field 'ip' (string) is required\"}");
         return;
+    }
+
+    const char *interface = "eth0"; // default
+        
+    if (json_object_object_get_ex(root, "interface", &interface_obj) &&
+        json_object_is_type(interface_obj, json_type_string)) {
+        interface = json_object_get_string(interface_obj);
     }
 
     int target_port = json_object_get_int(port_obj);
@@ -4184,6 +4378,9 @@ static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_messa
         return;
     }
 
+    char *old_ip = find_old_ip_by_port(config_content, target_port);
+    printf("Found old IP for port %d: %s\n", target_port, old_ip ? old_ip : "none");
+
     int update_status = -1;
     char *updated_config = update_proxy_ip_in_config(config_content, target_port, new_ip, &update_status);
     free(config_content);
@@ -4198,6 +4395,15 @@ static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_messa
         mg_http_reply(c, 500, "Content-Type: application/json\r\n",
                       "{\"error\":\"Failed to process configuration\"}");
         return;
+    }
+
+    char interface_error[1024] = {0};
+    int interface_success = add_ip_to_interface_with_cleanup(old_ip, new_ip, interface, 
+                                                            interface_error, sizeof(interface_error));
+    
+    if (!interface_success) {
+        printf("Warning: Interface IP update had issues: %s\n", interface_error);
+        // Continue anyway - we'll still update the config
     }
 
     int write_result = write_3proxy_config(updated_config);
