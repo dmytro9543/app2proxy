@@ -34,7 +34,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.3.3"
+#define VERSION_STRING "1.3.5"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -4937,6 +4937,289 @@ static void handle_version(struct mg_connection *c, struct mg_http_message *hm) 
                  "{\"service\":\"app2proxy\",\"version\":\"%s\",\"path\":\"/usr/bin/app2proxy\"}", VERSION_STRING);
 }
 
+// Function to change ONLY the proxy protocol type in configuration using port
+static int change_proxy_protocol_by_port(int port, const char *new_protocol, char *error_str, size_t error_size) {
+    printf("Changing proxy protocol for port %d to %s\n", port, new_protocol);
+    
+    // Validate protocol
+    const char *valid_protocols[] = {"socks-ipv6", "proxy-ipv6", "proxy-ipv4", "socks-ipv4"};
+    int valid = 0;
+    for (int i = 0; i < 4; i++) {
+        if (strcmp(new_protocol, valid_protocols[i]) == 0) {
+            valid = 1;
+            break;
+        }
+    }
+    
+    if (!valid) {
+        snprintf(error_str, error_size, "Invalid protocol. Must be one of: socks-ipv6, proxy-ipv6, proxy-ipv4, socks-ipv4");
+        return -1;
+    }
+    
+    // Read current configuration
+    char *config_content = read_3proxy_config();
+    if (!config_content) {
+        snprintf(error_str, error_size, "Failed to read configuration file");
+        return -1;
+    }
+    
+    FILE *temp_file = fopen("/etc/3proxy/3proxy.cfg.tmp", "w");
+    if (!temp_file) {
+        free(config_content);
+        snprintf(error_str, error_size, "Failed to create temporary file");
+        return -1;
+    }
+    
+    char *cursor = config_content;
+    int block_modified = 0;
+    int line_number = 0;
+    
+    while (*cursor) {
+        line_number++;
+        const char *line_end = strchr(cursor, '\n');
+        if (!line_end) line_end = cursor + strlen(cursor);
+        
+        size_t line_len = line_end - cursor;
+        char *line = malloc(line_len + 1);
+        if (!line) {
+            fclose(temp_file);
+            free(config_content);
+            snprintf(error_str, error_size, "Memory allocation failed");
+            return -1;
+        }
+        memcpy(line, cursor, line_len);
+        line[line_len] = '\0';
+        
+        // Check if this is a socks/proxy line
+        if ((strncmp(line, "socks ", 6) == 0 || strncmp(line, "proxy ", 6) == 0)) {
+            printf("Line %d: Found proxy line: %s\n", line_number, line);
+            
+            // Extract port from the line
+            int current_port = 0;
+            char *token;
+            char *saveptr = NULL;
+            char *line_copy = strdup(line);
+            if (!line_copy) {
+                free(line);
+                fclose(temp_file);
+                free(config_content);
+                snprintf(error_str, error_size, "Memory allocation failed");
+                return -1;
+            }
+            
+            token = strtok_r(line_copy, " \t", &saveptr);
+            while (token) {
+                if (strcmp(token, "-p") == 0) {
+                    char *port_str = strtok_r(NULL, " \t", &saveptr);
+                    if (port_str) {
+                        current_port = atoi(port_str);
+                        printf("  Found port parameter: %s -> %d\n", port_str, current_port);
+                    }
+                } else if (strncmp(token, "-p", 2) == 0 && token[2] != '\0') {
+                    current_port = atoi(token + 2);
+                    printf("  Found port parameter: %s -> %d\n", token + 2, current_port);
+                }
+                token = strtok_r(NULL, " \t", &saveptr);
+            }
+            
+            free(line_copy);
+            
+            // Check if this is our target port
+            if (current_port == port) {
+                printf("  MATCH! Target port %d found\n", port);
+                
+                // Parse what we want
+                int want_socks = (strncmp(new_protocol, "socks", 5) == 0);
+                int want_ipv6 = (strstr(new_protocol, "ipv6") != NULL);
+                
+                printf("  Changing to: %s (IPv6: %s)\n", 
+                       want_socks ? "socks" : "proxy",
+                       want_ipv6 ? "yes" : "no");
+                
+                // Build new line
+                char new_line[1024] = "";
+                
+                // Start with protocol
+                if (want_socks) {
+                    strcat(new_line, "socks");
+                } else {
+                    strcat(new_line, "proxy");
+                }
+                
+                // Add IPv6 flag if needed
+                if (want_ipv6) {
+                    strcat(new_line, " -64");
+                }
+                
+                // Copy all remaining tokens from original line
+                char *orig_token;
+                char *orig_saveptr = NULL;
+                char *orig_line_copy = strdup(line);
+                if (!orig_line_copy) {
+                    free(line);
+                    fclose(temp_file);
+                    free(config_content);
+                    snprintf(error_str, error_size, "Memory allocation failed");
+                    return -1;
+                }
+                
+                int token_count = 0;
+                orig_token = strtok_r(orig_line_copy, " \t", &orig_saveptr);
+                while (orig_token) {
+                    token_count++;
+                    
+                    // Skip the first token (socks/proxy) and -64 flag if present
+                    if (token_count > 1) {
+                        // Check if this is -64 flag (IPv6)
+                        if (strcmp(orig_token, "-64") != 0) {
+                            // Check if it starts with -64 (like -64xxx)
+                            if (strncmp(orig_token, "-64", 3) != 0) {
+                                strcat(new_line, " ");
+                                strcat(new_line, orig_token);
+                            }
+                        }
+                    }
+                    
+                    orig_token = strtok_r(NULL, " \t", &orig_saveptr);
+                }
+                
+                free(orig_line_copy);
+                
+                // Add newline
+                strcat(new_line, "\n");
+                
+                printf("  New line: %s", new_line);
+                
+                // Write the modified line
+                fprintf(temp_file, "%s", new_line);
+                block_modified = 1;
+            } else {
+                // Not our target port, write original line
+                fprintf(temp_file, "%s\n", line);
+            }
+            
+            free(line);
+        } else {
+            // Not a proxy line, write as-is
+            fprintf(temp_file, "%s\n", line);
+        }
+        
+        cursor = line_end + (*line_end ? 1 : 0);
+    }
+    
+    fclose(temp_file);
+    free(config_content);
+    
+    // Replace config file if modified
+    if (block_modified) {
+        if (rename("/etc/3proxy/3proxy.cfg.tmp", CONFIG_PATH) != 0) {
+            remove("/etc/3proxy/3proxy.cfg.tmp");
+            snprintf(error_str, error_size, "Failed to replace config file: %s", strerror(errno));
+            return -1;
+        }
+        
+        printf("Successfully changed protocol for port %d to %s\n", port, new_protocol);
+        snprintf(error_str, error_size, "Success");
+        return 0;
+    } else {
+        remove("/etc/3proxy/3proxy.cfg.tmp");
+        snprintf(error_str, error_size, "Port %d not found in configuration", port);
+        return -1;
+    }
+}
+
+// HTTP handler for changing proxy protocol by port (simple version)
+static void handle_change_protocol_by_port(struct mg_connection *c, struct mg_http_message *hm) {
+    printf("Handling change-protocol request\n");
+    
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    printf("Received JSON: %s\n", body_str);
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Extract parameters
+    json_object *port_obj, *protocol_obj;
+    int port = 0;
+    const char *protocol = NULL;
+    
+    if (!json_object_object_get_ex(root, "port", &port_obj) || 
+        !json_object_is_type(port_obj, json_type_int)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing port\"}");
+        return;
+    }
+    
+    if (!json_object_object_get_ex(root, "protocol", &protocol_obj) || 
+        !json_object_is_type(protocol_obj, json_type_string)) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing protocol\"}");
+        return;
+    }
+    
+    port = json_object_get_int(port_obj);
+    protocol = json_object_get_string(protocol_obj);
+    
+    // Validate port range
+    if (port < 1 || port > 65535) {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Port must be between 1 and 65535\"}");
+        return;
+    }
+    
+    printf("Changing protocol for port %d to %s\n", port, protocol);
+    
+    // Change protocol in configuration
+    char error_msg[256];
+    int result = change_proxy_protocol_by_port(port, protocol, error_msg, sizeof(error_msg));
+    
+    json_object *response = json_object_new_object();
+    
+    if (result == 0) {
+        // Restart 3proxy service
+        int restart_result = restart_3proxy_service();
+        
+        json_object_object_add(response, "status", json_object_new_string("success"));
+        json_object_object_add(response, "message", json_object_new_string(error_msg));
+        json_object_object_add(response, "port", json_object_new_int(port));
+        json_object_object_add(response, "protocol", json_object_new_string(protocol));
+        json_object_object_add(response, "service_restart", 
+                              json_object_new_string(restart_result == 0 ? "success" : "failed"));
+        
+        const char *response_str = json_object_to_json_string(response);
+        mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    } else {
+        json_object_object_add(response, "status", json_object_new_string("error"));
+        json_object_object_add(response, "message", json_object_new_string(error_msg));
+        json_object_object_add(response, "port", json_object_new_int(port));
+        
+        const char *response_str = json_object_to_json_string(response);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", "%s", response_str);
+    }
+    
+    json_object_put(response);
+    json_object_put(root);
+}
+
 // HTTP server event handler function
 static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_MSG) {
@@ -5208,6 +5491,10 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       }
       else if (mg_match(hm->uri, mg_str("/manage-blacklist"), NULL)) {
           handle_blacklist_manage(c, hm);
+          return;
+      }
+      else if (mg_match(hm->uri, mg_str("/change-protocol"), NULL)) {
+          handle_change_protocol_by_port(c, hm); // Use port-based version
           return;
       }
       else {
