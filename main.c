@@ -34,7 +34,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.3.5"
+#define VERSION_STRING "1.3.7"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -5220,6 +5220,849 @@ static void handle_change_protocol_by_port(struct mg_connection *c, struct mg_ht
     json_object_put(root);
 }
 
+// Helper function to extract port from a proxy line
+static int extract_port_from_proxy_line(const char *line) {
+    if (!line) return 0;
+    
+    char *port_str = strstr(line, "-p");
+    if (!port_str) return 0;
+    
+    port_str += 2; // Skip "-p"
+    
+    // Skip any spaces
+    while (*port_str == ' ' || *port_str == '\t') port_str++;
+    
+    // Parse the number
+    char *endptr;
+    long port = strtol(port_str, &endptr, 10);
+    
+    // Check if we successfully parsed a number
+    if (endptr == port_str) return 0;
+    
+    return (int)port;
+}
+
+// HTTP handler for removing blacklist from multiple proxies
+static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_message *hm) {
+    printf("Handling remove-blacklist request (batch)\n");
+    
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    printf("Received JSON: %s\n", body_str);
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Check if it's a single port or array of ports
+    json_object *port_obj = NULL;
+    json_object *ports_obj = NULL;
+    
+    // Try single port first (backward compatibility)
+    if (json_object_object_get_ex(root, "port", &port_obj) && 
+        json_object_is_type(port_obj, json_type_int)) {
+        // Convert single port to array for batch processing
+        int single_port = json_object_get_int(port_obj);
+        ports_obj = json_object_new_array();
+        json_object_array_add(ports_obj, json_object_new_int(single_port));
+        printf("Single port mode: %d\n", single_port);
+    }
+    // Try array of ports
+    else if (json_object_object_get_ex(root, "ports", &ports_obj) && 
+             json_object_is_type(ports_obj, json_type_array)) {
+        printf("Batch port mode\n");
+    }
+    else {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing port/ports parameter\"}");
+        return;
+    }
+    
+    int ports_count = json_object_array_length(ports_obj);
+    if (ports_count == 0) {
+        if (port_obj) json_object_put(ports_obj); // Clean up if we created it
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Empty ports array\"}");
+        return;
+    }
+    
+    // Validate all ports first
+    int *ports = malloc(ports_count * sizeof(int));
+    if (!ports) {
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    for (int i = 0; i < ports_count; i++) {
+        json_object *port_item = json_object_array_get_idx(ports_obj, i);
+        if (!json_object_is_type(port_item, json_type_int)) {
+            free(ports);
+            if (port_obj) json_object_put(ports_obj);
+            json_object_put(root);
+            mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                          "{\"error\":\"Invalid port in array\"}");
+            return;
+        }
+        
+        int port = json_object_get_int(port_item);
+        if (port < 1 || port > 65535) {
+            free(ports);
+            if (port_obj) json_object_put(ports_obj);
+            json_object_put(root);
+            mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                          "{\"error\":\"Port %d must be between 1 and 65535\"}", port);
+            return;
+        }
+        
+        ports[i] = port;
+        printf("Port %d: %d\n", i, port);
+    }
+    
+    // Process all ports in one go
+    printf("Processing %d ports to remove blacklist\n", ports_count);
+    
+    // Read the entire file into memory
+    FILE *file = fopen(CONFIG_PATH, "r");
+    if (!file) {
+        free(ports);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to open config file\"}");
+        return;
+    }
+    
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    char *file_content = malloc(file_size + 1);
+    if (!file_content) {
+        fclose(file);
+        free(ports);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    fread(file_content, 1, file_size, file);
+    file_content[file_size] = '\0';
+    fclose(file);
+    
+    // Create temp file
+    FILE *temp_file = fopen("/etc/3proxy/3proxy.cfg.tmp", "w");
+    if (!temp_file) {
+        free(file_content);
+        free(ports);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to create temp file\"}");
+        return;
+    }
+    
+    const char *cursor = file_content;
+    int in_proxy_block = 0;
+    int block_modified = 0;
+    int line_num = 0;
+    
+    // Store lines of current block temporarily
+    char block_lines[10][256];
+    int block_line_count = 0;
+    int current_block_has_blacklist = 0;
+    int current_block_port = 0;
+    
+    // Track results for each port
+    int *port_found = calloc(ports_count, sizeof(int));
+    int *port_had_blacklist = calloc(ports_count, sizeof(int));
+    int *port_modified = calloc(ports_count, sizeof(int));
+    
+    if (!port_found || !port_had_blacklist || !port_modified) {
+        free(file_content);
+        free(ports);
+        free(port_found);
+        free(port_had_blacklist);
+        free(port_modified);
+        fclose(temp_file);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    while (*cursor) {
+        line_num++;
+        const char *line_end = strchr(cursor, '\n');
+        if (!line_end) line_end = cursor + strlen(cursor);
+        
+        // Extract line
+        size_t line_len = line_end - cursor;
+        char line[1024];
+        if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
+        memcpy(line, cursor, line_len);
+        line[line_len] = '\0';
+        
+        // Trim whitespace
+        char *trimmed = line;
+        while (*trimmed && isspace((unsigned char)*trimmed)) trimmed++;
+        char *end = trimmed + strlen(trimmed) - 1;
+        while (end > trimmed && isspace((unsigned char)*end)) end--;
+        *(end + 1) = '\0';
+        
+        // Check for flush line (start of block)
+        if (strcmp(trimmed, "flush") == 0) {
+            // Write any pending block
+            if (block_line_count > 0) {
+                // Check if this block is one of our target ports
+                int is_target_port = 0;
+                int target_index = -1;
+                
+                for (int i = 0; i < ports_count; i++) {
+                    if (current_block_port == ports[i]) {
+                        is_target_port = 1;
+                        target_index = i;
+                        port_found[i] = 1;
+                        if (current_block_has_blacklist) {
+                            port_had_blacklist[i] = 1;
+                        }
+                        break;
+                    }
+                }
+                
+                // Process block
+                if (is_target_port && current_block_has_blacklist) {
+                    // Remove blacklist from this block
+                    printf("Processing block for port %d - removing blacklist\n", current_block_port);
+                    for (int i = 0; i < block_line_count; i++) {
+                        if (strncmp(block_lines[i], "include /conf/blacklist.txt", 27) == 0) {
+                            printf("Skipping blacklist line for port %d\n", current_block_port);
+                            block_modified = 1;
+                            port_modified[target_index] = 1;
+                            continue;
+                        }
+                        fprintf(temp_file, "%s\n", block_lines[i]);
+                    }
+                } else {
+                    // Write block as-is
+                    for (int i = 0; i < block_line_count; i++) {
+                        fprintf(temp_file, "%s\n", block_lines[i]);
+                    }
+                }
+            }
+            
+            // Start new block
+            block_line_count = 0;
+            current_block_has_blacklist = 0;
+            current_block_port = 0;
+            in_proxy_block = 1;
+            
+            strcpy(block_lines[block_line_count++], trimmed);
+        }
+        // We're inside a proxy block
+        else if (in_proxy_block) {
+            // Store line in block buffer
+            if (block_line_count < 10) {
+                strcpy(block_lines[block_line_count++], trimmed);
+            }
+            
+            // Check what type of line this is
+            if (strncmp(trimmed, "include /conf/blacklist.txt", 27) == 0) {
+                current_block_has_blacklist = 1;
+                printf("Current block has blacklist at line %d\n", line_num);
+            }
+            else if (strncmp(trimmed, "socks ", 6) == 0 || strncmp(trimmed, "proxy ", 6) == 0) {
+                // Extract port from proxy line
+                int current_port = extract_port_from_proxy_line(trimmed);
+                current_block_port = current_port;
+                printf("Current block has proxy on port %d at line %d\n", current_port, line_num);
+            }
+            // Check for end of block (empty line)
+            else if (strlen(trimmed) == 0) {
+                in_proxy_block = 0;
+            }
+        }
+        // Lines outside blocks (global config)
+        else {
+            fprintf(temp_file, "%s\n", trimmed);
+        }
+        
+        cursor = line_end + (*line_end ? 1 : 0);
+    }
+    
+    // Write any remaining block at end of file
+    if (block_line_count > 0) {
+        // Check if this block is one of our target ports
+        int is_target_port = 0;
+        int target_index = -1;
+        
+        for (int i = 0; i < ports_count; i++) {
+            if (current_block_port == ports[i]) {
+                is_target_port = 1;
+                target_index = i;
+                port_found[i] = 1;
+                if (current_block_has_blacklist) {
+                    port_had_blacklist[i] = 1;
+                }
+                break;
+            }
+        }
+        
+        // Process block
+        if (is_target_port && current_block_has_blacklist) {
+            // Remove blacklist from this block
+            printf("Processing final block for port %d - removing blacklist\n", current_block_port);
+            for (int i = 0; i < block_line_count; i++) {
+                if (strncmp(block_lines[i], "include /conf/blacklist.txt", 27) == 0) {
+                    printf("Skipping blacklist line for port %d\n", current_block_port);
+                    block_modified = 1;
+                    port_modified[target_index] = 1;
+                    continue;
+                }
+                fprintf(temp_file, "%s\n", block_lines[i]);
+            }
+        } else {
+            // Write block as-is
+            for (int i = 0; i < block_line_count; i++) {
+                fprintf(temp_file, "%s\n", block_lines[i]);
+            }
+        }
+    }
+    
+    fclose(temp_file);
+    free(file_content);
+    
+    // Create response
+    json_object *response = json_object_new_object();
+    
+    if (block_modified) {
+        if (rename("/etc/3proxy/3proxy.cfg.tmp", CONFIG_PATH) != 0) {
+            remove("/etc/3proxy/3proxy.cfg.tmp");
+            json_object_object_add(response, "status", json_object_new_string("error"));
+            json_object_object_add(response, "message", json_object_new_string("Failed to replace config file"));
+        } else {
+            // Restart 3proxy service
+            int restart_result = restart_3proxy_service();
+            
+            json_object_object_add(response, "status", json_object_new_string("success"));
+            json_object_object_add(response, "message", json_object_new_string("Blacklist removal processed"));
+            json_object_object_add(response, "service_restart", 
+                                  json_object_new_string(restart_result == 0 ? "success" : "failed"));
+            
+            // Add detailed results
+            //json_object *results_array = json_object_new_array();
+            int total_modified = 0;
+            int total_found = 0;
+            
+            for (int i = 0; i < ports_count; i++) {
+                //json_object *result = json_object_new_object();
+                //json_object_object_add(result, "port", json_object_new_int(ports[i]));
+                
+                if (port_found[i]) {
+                    //json_object_object_add(result, "found", json_object_new_boolean(1));
+                    total_found++;
+                    
+                    if (port_had_blacklist[i]) {
+                        //json_object_object_add(result, "had_blacklist", json_object_new_boolean(1));
+                        if (port_modified[i]) {
+                            //json_object_object_add(result, "modified", json_object_new_boolean(1));
+                            total_modified++;
+                        } else {
+                            //json_object_object_add(result, "modified", json_object_new_boolean(0));
+                        }
+                    } else {
+                        //json_object_object_add(result, "had_blacklist", json_object_new_boolean(0));
+                        //json_object_object_add(result, "modified", json_object_new_boolean(0));
+                    }
+                } else {
+                    //json_object_object_add(result, "found", json_object_new_boolean(0));
+                    //json_object_object_add(result, "had_blacklist", json_object_new_boolean(0));
+                    //json_object_object_add(result, "modified", json_object_new_boolean(0));
+                }
+                
+                //json_object_array_add(results_array, result);
+            }
+            
+            //json_object_object_add(response, "results", results_array);
+            json_object_object_add(response, "total_ports", json_object_new_int(ports_count));
+            json_object_object_add(response, "ports_found", json_object_new_int(total_found));
+            json_object_object_add(response, "ports_modified", json_object_new_int(total_modified));
+        }
+    } else {
+        remove("/etc/3proxy/3proxy.cfg.tmp");
+        json_object_object_add(response, "status", json_object_new_string("partial"));
+        json_object_object_add(response, "message", json_object_new_string("No blacklists were removed"));
+        
+        // Add results for what was found
+        //json_object *results_array = json_object_new_array();
+        int total_found = 0;
+        
+        for (int i = 0; i < ports_count; i++) {
+            //json_object *result = json_object_new_object();
+            //json_object_object_add(result, "port", json_object_new_int(ports[i]));
+            
+            if (port_found[i]) {
+                //json_object_object_add(result, "found", json_object_new_boolean(1));
+                total_found++;
+                //json_object_object_add(result, "had_blacklist", json_object_new_boolean(port_had_blacklist[i]));
+                //json_object_object_add(result, "modified", json_object_new_boolean(0));
+            } else {
+                //json_object_object_add(result, "found", json_object_new_boolean(0));
+                //json_object_object_add(result, "had_blacklist", json_object_new_boolean(0));
+                //json_object_object_add(result, "modified", json_object_new_boolean(0));
+            }
+            
+            //json_object_array_add(results_array, result);
+        }
+        
+        //json_object_object_add(response, "results", results_array);
+        json_object_object_add(response, "total_ports", json_object_new_int(ports_count));
+        json_object_object_add(response, "ports_found", json_object_new_int(total_found));
+    }
+    
+    const char *response_str = json_object_to_json_string(response);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    
+    // Cleanup
+    free(ports);
+    free(port_found);
+    free(port_had_blacklist);
+    free(port_modified);
+    if (port_obj) json_object_put(ports_obj); // Clean up if we created the array
+    json_object_put(response);
+    json_object_put(root);
+}
+
+// HTTP handler for adding blacklist to multiple proxies
+static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message *hm) {
+    printf("Handling add-blacklist request (batch)\n");
+    
+    // Parse JSON body
+    char *body_str = malloc(hm->body.len + 1);
+    if (!body_str) {
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    memcpy(body_str, hm->body.buf, hm->body.len);
+    body_str[hm->body.len] = '\0';
+    
+    printf("Received JSON: %s\n", body_str);
+    
+    json_object *root = json_tokener_parse(body_str);
+    free(body_str);
+    
+    if (!root) {
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    // Check if it's a single port or array of ports
+    json_object *port_obj = NULL;
+    json_object *ports_obj = NULL;
+    
+    // Try single port first (backward compatibility)
+    if (json_object_object_get_ex(root, "port", &port_obj) && 
+        json_object_is_type(port_obj, json_type_int)) {
+        // Convert single port to array for batch processing
+        int single_port = json_object_get_int(port_obj);
+        ports_obj = json_object_new_array();
+        json_object_array_add(ports_obj, json_object_new_int(single_port));
+        printf("Single port mode: %d\n", single_port);
+    }
+    // Try array of ports
+    else if (json_object_object_get_ex(root, "ports", &ports_obj) && 
+             json_object_is_type(ports_obj, json_type_array)) {
+        printf("Batch port mode\n");
+    }
+    else {
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Invalid or missing port/ports parameter\"}");
+        return;
+    }
+    
+    int ports_count = json_object_array_length(ports_obj);
+    if (ports_count == 0) {
+        if (port_obj) json_object_put(ports_obj); // Clean up if we created it
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Empty ports array\"}");
+        return;
+    }
+    
+    // Validate all ports first
+    int *ports = malloc(ports_count * sizeof(int));
+    if (!ports) {
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    for (int i = 0; i < ports_count; i++) {
+        json_object *port_item = json_object_array_get_idx(ports_obj, i);
+        if (!json_object_is_type(port_item, json_type_int)) {
+            free(ports);
+            if (port_obj) json_object_put(ports_obj);
+            json_object_put(root);
+            mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                          "{\"error\":\"Invalid port in array\"}");
+            return;
+        }
+        
+        int port = json_object_get_int(port_item);
+        if (port < 1 || port > 65535) {
+            free(ports);
+            if (port_obj) json_object_put(ports_obj);
+            json_object_put(root);
+            mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+                          "{\"error\":\"Port %d must be between 1 and 65535\"}", port);
+            return;
+        }
+        
+        ports[i] = port;
+        printf("Port %d: %d\n", i, port);
+    }
+    
+    // Read the entire file into memory
+    FILE *file = fopen(CONFIG_PATH, "r");
+    if (!file) {
+        free(ports);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to open config file\"}");
+        return;
+    }
+    
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    char *file_content = malloc(file_size + 1);
+    if (!file_content) {
+        fclose(file);
+        free(ports);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    fread(file_content, 1, file_size, file);
+    file_content[file_size] = '\0';
+    fclose(file);
+    
+    // Create temp file
+    FILE *temp_file = fopen("/etc/3proxy/3proxy.cfg.tmp", "w");
+    if (!temp_file) {
+        free(file_content);
+        free(ports);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Failed to create temp file\"}");
+        return;
+    }
+    
+    const char *cursor = file_content;
+    int in_proxy_block = 0;
+    int block_modified = 0;
+    int line_num = 0;
+    
+    // Store lines of current block temporarily
+    char block_lines[10][256];
+    int block_line_count = 0;
+    int current_block_has_blacklist = 0;
+    int current_block_port = 0;
+    
+    // Track results for each port
+    int *port_found = calloc(ports_count, sizeof(int));
+    int *port_had_blacklist = calloc(ports_count, sizeof(int));
+    int *port_modified = calloc(ports_count, sizeof(int));
+    
+    if (!port_found || !port_had_blacklist || !port_modified) {
+        free(file_content);
+        free(ports);
+        free(port_found);
+        free(port_had_blacklist);
+        free(port_modified);
+        fclose(temp_file);
+        if (port_obj) json_object_put(ports_obj);
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+                      "{\"error\":\"Memory allocation failed\"}");
+        return;
+    }
+    
+    while (*cursor) {
+        line_num++;
+        const char *line_end = strchr(cursor, '\n');
+        if (!line_end) line_end = cursor + strlen(cursor);
+        
+        // Extract line
+        size_t line_len = line_end - cursor;
+        char line[256];
+        if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
+        memcpy(line, cursor, line_len);
+        line[line_len] = '\0';
+        
+        // Trim
+        char *trimmed = line;
+        while (*trimmed && isspace((unsigned char)*trimmed)) trimmed++;
+        char *end = trimmed + strlen(trimmed) - 1;
+        while (end > trimmed && isspace((unsigned char)*end)) end--;
+        *(end + 1) = '\0';
+        
+        // Check for flush line (start of block)
+        if (strcmp(trimmed, "flush") == 0) {
+            // Write any pending block
+            if (block_line_count > 0) {
+                // Check if this block is one of our target ports
+                int is_target_port = 0;
+                int target_index = -1;
+                
+                for (int i = 0; i < ports_count; i++) {
+                    if (current_block_port == ports[i]) {
+                        is_target_port = 1;
+                        target_index = i;
+                        port_found[i] = 1;
+                        if (current_block_has_blacklist) {
+                            port_had_blacklist[i] = 1;
+                        }
+                        break;
+                    }
+                }
+                
+                // Process block
+                if (is_target_port && !current_block_has_blacklist) {
+                    // Add blacklist to this block
+                    printf("Processing block for port %d - adding blacklist\n", current_block_port);
+                    fprintf(temp_file, "flush\n");
+                    fprintf(temp_file, "include /conf/blacklist.txt\n");
+                    block_modified = 1;
+                    port_modified[target_index] = 1;
+                    
+                    // Write remaining block lines (skip the flush we already wrote)
+                    for (int i = 1; i < block_line_count; i++) {
+                        fprintf(temp_file, "%s\n", block_lines[i]);
+                    }
+                } else {
+                    // Write block as-is
+                    for (int i = 0; i < block_line_count; i++) {
+                        fprintf(temp_file, "%s\n", block_lines[i]);
+                    }
+                }
+            }
+            
+            // Start new block
+            block_line_count = 0;
+            current_block_has_blacklist = 0;
+            current_block_port = 0;
+            in_proxy_block = 1;
+            
+            strcpy(block_lines[block_line_count++], trimmed);
+        }
+        // We're inside a proxy block
+        else if (in_proxy_block) {
+            // Store line in block buffer
+            if (block_line_count < 10) {
+                strcpy(block_lines[block_line_count++], trimmed);
+            }
+            
+            // Check what type of line this is
+            if (strncmp(trimmed, "include /conf/blacklist.txt", 27) == 0) {
+                current_block_has_blacklist = 1;
+                printf("Current block has blacklist at line %d\n", line_num);
+            }
+            else if (strncmp(trimmed, "socks ", 6) == 0 || strncmp(trimmed, "proxy ", 6) == 0) {
+                // Extract port from proxy line
+                int current_port = extract_port_from_proxy_line(trimmed);
+                current_block_port = current_port;
+                printf("Current block has proxy on port %d at line %d\n", current_port, line_num);
+            }
+            // Check for end of block (empty line)
+            else if (strlen(trimmed) == 0) {
+                in_proxy_block = 0;
+            }
+        }
+        // Lines outside blocks (global config)
+        else {
+            fprintf(temp_file, "%s\n", trimmed);
+        }
+        
+        cursor = line_end + (*line_end ? 1 : 0);
+    }
+    
+    // Write any remaining block at end of file
+    if (block_line_count > 0) {
+        // Check if this block is one of our target ports
+        int is_target_port = 0;
+        int target_index = -1;
+        
+        for (int i = 0; i < ports_count; i++) {
+            if (current_block_port == ports[i]) {
+                is_target_port = 1;
+                target_index = i;
+                port_found[i] = 1;
+                if (current_block_has_blacklist) {
+                    port_had_blacklist[i] = 1;
+                }
+                break;
+            }
+        }
+        
+        // Process block
+        if (is_target_port && !current_block_has_blacklist) {
+            // Add blacklist to this block
+            printf("Processing final block for port %d - adding blacklist\n", current_block_port);
+            fprintf(temp_file, "flush\n");
+            fprintf(temp_file, "include /conf/blacklist.txt\n");
+            block_modified = 1;
+            port_modified[target_index] = 1;
+            
+            // Write remaining block lines (skip the flush we already wrote)
+            for (int i = 1; i < block_line_count; i++) {
+                fprintf(temp_file, "%s\n", block_lines[i]);
+            }
+        } else {
+            // Write block as-is
+            for (int i = 0; i < block_line_count; i++) {
+                fprintf(temp_file, "%s\n", block_lines[i]);
+            }
+        }
+    }
+    
+    fclose(temp_file);
+    free(file_content);
+    
+    // Create response
+    json_object *response = json_object_new_object();
+    
+    if (block_modified) {
+        if (rename("/etc/3proxy/3proxy.cfg.tmp", CONFIG_PATH) != 0) {
+            remove("/etc/3proxy/3proxy.cfg.tmp");
+            json_object_object_add(response, "status", json_object_new_string("error"));
+            json_object_object_add(response, "message", json_object_new_string("Failed to replace config file"));
+        } else {
+            // Restart 3proxy service
+            int restart_result = restart_3proxy_service();
+            
+            json_object_object_add(response, "status", json_object_new_string("success"));
+            json_object_object_add(response, "message", json_object_new_string("Blacklist addition processed"));
+            json_object_object_add(response, "service_restart", 
+                                  json_object_new_string(restart_result == 0 ? "success" : "failed"));
+            
+            // Add detailed results
+            //json_object *results_array = json_object_new_array();
+            int total_modified = 0;
+            int total_found = 0;
+            
+            for (int i = 0; i < ports_count; i++) {
+                //json_object *result = json_object_new_object();
+                //json_object_object_add(result, "port", json_object_new_int(ports[i]));
+                
+                if (port_found[i]) {
+                    //json_object_object_add(result, "found", json_object_new_boolean(1));
+                    total_found++;
+                    
+                    if (port_had_blacklist[i]) {
+                        //json_object_object_add(result, "had_blacklist", json_object_new_boolean(1));
+                        //json_object_object_add(result, "modified", json_object_new_boolean(0)); // Already had blacklist
+                    } else {
+                        //json_object_object_add(result, "had_blacklist", json_object_new_boolean(0));
+                        if (port_modified[i]) {
+                            //json_object_object_add(result, "modified", json_object_new_boolean(1));
+                            total_modified++;
+                        } else {
+                            //json_object_object_add(result, "modified", json_object_new_boolean(0));
+                        }
+                    }
+                } else {
+                    //json_object_object_add(result, "found", json_object_new_boolean(0));
+                    //json_object_object_add(result, "had_blacklist", json_object_new_boolean(0));
+                    //json_object_object_add(result, "modified", json_object_new_boolean(0));
+                }
+                
+                //json_object_array_add(results_array, result);
+            }
+            
+            //json_object_object_add(response, "results", results_array);
+            json_object_object_add(response, "total_ports", json_object_new_int(ports_count));
+            json_object_object_add(response, "ports_found", json_object_new_int(total_found));
+            json_object_object_add(response, "ports_modified", json_object_new_int(total_modified));
+        }
+    } else {
+        remove("/etc/3proxy/3proxy.cfg.tmp");
+        json_object_object_add(response, "status", json_object_new_string("partial"));
+        json_object_object_add(response, "message", json_object_new_string("No blacklists were added"));
+        
+        // Add results for what was found
+        //json_object *results_array = json_object_new_array();
+        int total_found = 0;
+        
+        for (int i = 0; i < ports_count; i++) {
+            //json_object *result = json_object_new_object();
+            //json_object_object_add(result, "port", json_object_new_int(ports[i]));
+            
+            if (port_found[i]) {
+                //json_object_object_add(result, "found", json_object_new_boolean(1));
+                total_found++;
+                //json_object_object_add(result, "had_blacklist", json_object_new_boolean(port_had_blacklist[i]));
+                //json_object_object_add(result, "modified", json_object_new_boolean(0));
+            } else {
+                //json_object_object_add(result, "found", json_object_new_boolean(0));
+                //json_object_object_add(result, "had_blacklist", json_object_new_boolean(0));
+                //json_object_object_add(result, "modified", json_object_new_boolean(0));
+            }
+            
+            //json_object_array_add(results_array, result);
+        }
+        
+        //json_object_object_add(response, "results", results_array);*
+        json_object_object_add(response, "total_ports", json_object_new_int(ports_count));
+        json_object_object_add(response, "ports_found", json_object_new_int(total_found));
+    }
+    
+    const char *response_str = json_object_to_json_string(response);
+    mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
+    
+    // Cleanup
+    free(ports);
+    free(port_found);
+    free(port_had_blacklist);
+    free(port_modified);
+    if (port_obj) json_object_put(ports_obj); // Clean up if we created the array
+    json_object_put(response);
+    json_object_put(root);
+}
+
 // HTTP server event handler function
 static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_MSG) {
@@ -5495,6 +6338,14 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       }
       else if (mg_match(hm->uri, mg_str("/change-protocol"), NULL)) {
           handle_change_protocol_by_port(c, hm); // Use port-based version
+          return;
+      }
+      else if (mg_match(hm->uri, mg_str("/remove-blacklist"), NULL)) {
+          handle_remove_blacklist(c, hm);
+          return;
+      }
+      else if (mg_match(hm->uri, mg_str("/add-blacklist"), NULL)) {
+          handle_add_blacklist(c, hm);
           return;
       }
       else {
