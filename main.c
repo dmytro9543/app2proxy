@@ -36,7 +36,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.3.8"
+#define VERSION_STRING "1.3.9"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -70,6 +70,7 @@ typedef void (*sighandler_t) (int);
 
 #define MAX_CONFIG_BACKUPS 1000
 #define LOG_RETENTION_DAYS 7
+#define MAX_LOG_FILE_SIZE_KB (10 * 1024)  // 10MB max per log file before truncation
 
 // Add these function declarations (after existing ones)
 static void ensure_log_directories(void);
@@ -81,6 +82,9 @@ static char* get_client_ip_from_connection(struct mg_connection *c);
 static void compare_config_snapshots(const char *api_name);
 static int count_users_in_line(const char *users_line);
 static int cleanup_old_logs(int retention_days);
+static int cleanup_directory_by_age(const char *dir_path, int retention_days, const char *filename_pattern);
+static int truncate_log_file(const char *filepath, int max_size_kb);
+static int truncate_user_change_logs(int max_size_kb);
 static void* log_cleanup_thread(void* arg);
 static void handle_cleanup_logs(struct mg_connection *c, struct mg_http_message *hm);
 
@@ -656,8 +660,9 @@ static int count_users_in_line(const char *users_line) {
 // =============================================================================
 
 // Delete files older than retention_days in a directory
+// If filename_pattern is not NULL, only delete files containing that pattern
 // Returns number of files deleted
-static int cleanup_directory_by_age(const char *dir_path, int retention_days) {
+static int cleanup_directory_by_age(const char *dir_path, int retention_days, const char *filename_pattern) {
     DIR *dir = opendir(dir_path);
     if (!dir) {
         printf("cleanup_directory_by_age: Cannot open directory %s\n", dir_path);
@@ -675,6 +680,11 @@ static int cleanup_directory_by_age(const char *dir_path, int retention_days) {
     while ((entry = readdir(dir)) != NULL) {
         // Skip . and ..
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        
+        // If pattern specified, only process matching files
+        if (filename_pattern != NULL && strstr(entry->d_name, filename_pattern) == NULL) {
             continue;
         }
         
@@ -698,41 +708,141 @@ static int cleanup_directory_by_age(const char *dir_path, int retention_days) {
     return deleted_count;
 }
 
+// Truncate a log file if it exceeds max_size_kb, keeping the last portion
+// Returns 1 if truncated, 0 if no action needed, -1 on error
+static int truncate_log_file(const char *filepath, int max_size_kb) {
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
+        return 0;  // File doesn't exist, nothing to do
+    }
+    
+    long max_bytes = max_size_kb * 1024L;
+    if (st.st_size <= max_bytes) {
+        return 0;  // File is within limits
+    }
+    
+    printf("Truncating oversized log: %s (%ld KB > %d KB)\n", 
+           filepath, st.st_size / 1024, max_size_kb);
+    
+    // Read the last portion of the file
+    FILE *fp = fopen(filepath, "r");
+    if (!fp) return -1;
+    
+    long keep_bytes = max_bytes / 2;  // Keep last 50% of max size
+    fseek(fp, -keep_bytes, SEEK_END);
+    
+    // Skip to next newline to avoid partial lines
+    int ch;
+    while ((ch = fgetc(fp)) != EOF && ch != '\n');
+    
+    // Read remaining content
+    long start_pos = ftell(fp);
+    long content_size = st.st_size - start_pos;
+    
+    char *content = malloc(content_size + 1);
+    if (!content) {
+        fclose(fp);
+        return -1;
+    }
+    
+    size_t read_size = fread(content, 1, content_size, fp);
+    content[read_size] = '\0';
+    fclose(fp);
+    
+    // Write truncated content back
+    fp = fopen(filepath, "w");
+    if (!fp) {
+        free(content);
+        return -1;
+    }
+    
+    fprintf(fp, "--- Log truncated at %s ---\n", 
+            ctime(&(time_t){time(NULL)}));
+    fwrite(content, 1, read_size, fp);
+    fclose(fp);
+    free(content);
+    
+    printf("Truncated %s: %ld KB -> %ld KB\n", 
+           filepath, st.st_size / 1024, (read_size + 50) / 1024);
+    return 1;
+}
+
+// Truncate all per-API log files in user_changes directory if oversized
+static int truncate_user_change_logs(int max_size_kb) {
+    char dir_path[1024];
+    snprintf(dir_path, sizeof(dir_path), "%s/user_changes", LOG_DIR);
+    
+    DIR *dir = opendir(dir_path);
+    if (!dir) return 0;
+    
+    struct dirent *entry;
+    int truncated_count = 0;
+    char filepath[1024];
+    
+    while ((entry = readdir(dir)) != NULL) {
+        // Only process .log files that are NOT diff files
+        if (strstr(entry->d_name, ".log") != NULL && 
+            strncmp(entry->d_name, "diff_", 5) != 0) {
+            
+            snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, entry->d_name);
+            if (truncate_log_file(filepath, max_size_kb) == 1) {
+                truncated_count++;
+            }
+        }
+    }
+    
+    closedir(dir);
+    return truncated_count;
+}
+
 // Main cleanup function - cleans all log directories
 // Returns total number of files deleted
 static int cleanup_old_logs(int retention_days) {
     printf("=== Starting log cleanup (retention: %d days) ===\n", retention_days);
     
     int total_deleted = 0;
+    int total_truncated = 0;
     char subdir_path[1024];
     
-    // List of subdirectories to clean
-    const char *subdirs[] = {
+    // Directories to clean by file age (all files)
+    const char *age_cleanup_dirs[] = {
         "/api_calls",
 //        "/config_backups",
-        "/user_changes",
         "/config_snapshots",
         NULL
     };
     
-    // Clean each subdirectory
-    for (int i = 0; subdirs[i] != NULL; i++) {
-        snprintf(subdir_path, sizeof(subdir_path), "%s%s", LOG_DIR, subdirs[i]);
+    // Clean directories where ALL files can be deleted by age
+    for (int i = 0; age_cleanup_dirs[i] != NULL; i++) {
+        snprintf(subdir_path, sizeof(subdir_path), "%s%s", LOG_DIR, age_cleanup_dirs[i]);
         printf("Cleaning directory: %s\n", subdir_path);
-        int deleted = cleanup_directory_by_age(subdir_path, retention_days);
+        int deleted = cleanup_directory_by_age(subdir_path, retention_days, NULL);
         total_deleted += deleted;
-        printf("  Deleted %d files from %s\n", deleted, subdirs[i]);
+        printf("  Deleted %d files from %s\n", deleted, age_cleanup_dirs[i]);
     }
+    
+    // user_changes: only delete diff_*.log files by age (per-API logs are persistent)
+    snprintf(subdir_path, sizeof(subdir_path), "%s/user_changes", LOG_DIR);
+    printf("Cleaning directory: %s (diff files only)\n", subdir_path);
+    int deleted = cleanup_directory_by_age(subdir_path, retention_days, "diff_");
+    total_deleted += deleted;
+    printf("  Deleted %d diff files from /user_changes\n", deleted);
+    
+    // Truncate per-API log files if they exceed MAX_LOG_FILE_SIZE_KB
+    printf("Checking per-API log file sizes...\n");
+    total_truncated = truncate_user_change_logs(MAX_LOG_FILE_SIZE_KB);
+    printf("  Truncated %d oversized log files\n", total_truncated);
     
     // Also clean the main CONFIG_BACKUP_DIR if it's different from LOG_DIR/config_backups
     if (strstr(CONFIG_BACKUP_DIR, LOG_DIR) == NULL) {
         printf("Cleaning directory: %s\n", CONFIG_BACKUP_DIR);
-        int deleted = cleanup_directory_by_age(CONFIG_BACKUP_DIR, retention_days);
+        deleted = cleanup_directory_by_age(CONFIG_BACKUP_DIR, retention_days, NULL);
         total_deleted += deleted;
         printf("  Deleted %d files from config_backups\n", deleted);
     }
     
-    printf("=== Log cleanup complete: %d total files deleted ===\n", total_deleted);
+    printf("=== Log cleanup complete: %d files deleted, %d files truncated ===\n", 
+           total_deleted, total_truncated);
     return total_deleted;
 }
 
@@ -3272,7 +3382,7 @@ static char* update_users_line(const char *current_config, const char *username,
     return new_config;
 }
 
-// Delete proxy block by username - safe version (no VLAs, no O(nÂ²), atomic write)
+// Delete proxy block by username - safe version (no VLAs, no O(nÃ‚Â²), atomic write)
 static int delete_proxy_by_username_simple(const char *username) {
     printf("Deleting proxy for user: %s\n", username);
     
@@ -3290,7 +3400,7 @@ static int delete_proxy_by_username_simple(const char *username) {
         return -1;
     }
     
-    size_t out_pos = 0;  // efficient output position tracking (no O(nÂ²))
+    size_t out_pos = 0;  // efficient output position tracking (no O(nÃ‚Â²))
     new_config[0] = '\0';
     
     char *current = config;
@@ -5929,7 +6039,7 @@ static void handle_change_protocol(struct mg_connection *c, struct mg_http_messa
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated â€” no truncation)
+        // Extract line (dynamically allocated Ã¢â‚¬â€ no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) {
@@ -6326,7 +6436,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated â€” no truncation)
+        // Extract line (dynamically allocated Ã¢â‚¬â€ no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -6744,7 +6854,7 @@ static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated â€” no truncation)
+        // Extract line (dynamically allocated Ã¢â‚¬â€ no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
