@@ -34,7 +34,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.3.7"
+#define VERSION_STRING "1.3.8"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -47,11 +47,11 @@ enum {
   RADIUS
 };
 
-#define MAX_BUFFER 1024
-#define MAX_BLACKLIST_LINES 100000
+#define MAX_BUFFER 50000
+#define MAX_BLACKLIST_LINES 50000
 
 typedef struct {
-    char name[32];
+    char name[256];
     int is_running;
     char pid[64];
 } ServiceStatus;
@@ -60,6 +60,23 @@ double cpu_usage = 0, disk_usage = 0;
 double mem_used = 0;
 
 typedef void (*sighandler_t) (int);
+
+// Add near other constants
+#define LOG_DIR "/var/log/app2proxy"
+//#define CONFIG_BACKUP_DIR "/var/backup_3proxy_configs"
+#define CONFIG_BACKUP_DIR "/var/log/app2proxy/config_backups"
+
+#define MAX_CONFIG_BACKUPS 1000
+
+// Add these function declarations (after existing ones)
+static void ensure_log_directories(void);
+static void log_api_with_config_backup(const char *method, const char *uri, 
+                                      struct mg_connection *c, struct mg_http_message *hm);
+static void backup_config_with_api_info(const char *api_name, const char *stage);
+static void log_users_state_for_api(const char *api_name, const char *stage);
+static char* get_client_ip_from_connection(struct mg_connection *c);
+static void compare_config_snapshots(const char *api_name);
+static int count_users_in_line(const char *users_line);
 
 char* test_proxy(const char* proxy, const char* tipo);
 char* test_all_proxies(const char* proxy);
@@ -120,6 +137,514 @@ int set_sighandler(sighandler_t sig_usr)
   return 0;
 }
 
+// Ensure all necessary directories exist
+static void ensure_log_directories(void) {
+    static int initialized = 0;
+    if (initialized) return;
+    
+    struct stat st = {0};
+    
+    // Create main directories if they don't exist
+    char *dirs[] = {
+        LOG_DIR,
+        CONFIG_BACKUP_DIR,
+        NULL
+    };
+    
+    for (int i = 0; dirs[i] != NULL; i++) {
+        if (stat(dirs[i], &st) == -1) {
+            mkdir(dirs[i], 0755);
+            printf("Created directory: %s\n", dirs[i]);
+        }
+    }
+    
+    // Create subdirectories for logs
+    char subdirs[][256] = {
+        "/api_calls",
+        "/config_backups",
+        "/user_changes",
+        "/config_snapshots"
+    };
+    
+    for (int i = 0; i < sizeof(subdirs)/sizeof(subdirs[0]); i++) {
+        char path[9999];
+        snprintf(path, sizeof(path), "%s%s", LOG_DIR, subdirs[i]);
+        if (stat(path, &st) == -1) {
+            mkdir(path, 0755);
+        }
+    }
+    
+    initialized = 1;
+}
+
+static char* get_client_ip_from_connection(struct mg_connection *c) {
+    static char ip[64] = {0};
+    
+    // Try different methods to get client IP
+    // Note: c->data might not always be mg_http_message
+    // Let's use a safer approach
+    
+    // Method 1: Check if connection has peer information
+    struct mg_addr *addr = &c->rem;
+    if (addr && addr->ip) {
+        // For IPv4
+        unsigned char *p = (unsigned char *)&addr->ip;
+        snprintf(ip, sizeof(ip), "%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
+        return ip;
+    }
+    
+    // Method 2: Try to get from headers if we have HTTP message
+    if (c->data) {
+        struct mg_http_message *hm = (struct mg_http_message*)c->data;
+        struct mg_str *x_forwarded = mg_http_get_header(hm, "X-Forwarded-For");
+        if (x_forwarded && x_forwarded->len > 0) {
+            // Use mg_str's buffer directly
+            int len = x_forwarded->len < sizeof(ip)-1 ? x_forwarded->len : sizeof(ip)-1;
+            memcpy(ip, x_forwarded->buf, len);  // Changed from ptr to buf
+            ip[len] = '\0';
+            
+            // If there are multiple IPs (comma-separated), take the first one
+            char *comma = strchr(ip, ',');
+            if (comma) *comma = '\0';
+            
+            return ip;
+        }
+    }
+    
+    // Fallback
+    strcpy(ip, "unknown");
+    return ip;
+}
+
+// Extract API name from URI (remove leading slash)
+static const char* get_api_name(const char *uri) {
+    if (!uri || uri[0] != '/') return "unknown";
+    return uri + 1; // Skip leading '/'
+}
+
+static void backup_config_with_api_info(const char *api_name, const char *stage) {
+    ensure_log_directories();
+    
+    char timestamp[32];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
+    
+    // Safer backup filename generation
+    char backup_file[999];
+    char safe_api_name[999];
+    char safe_stage[999];
+    
+    // Sanitize API name and stage
+    strncpy(safe_api_name, api_name, sizeof(safe_api_name) - 1);
+    safe_api_name[sizeof(safe_api_name) - 1] = '\0';
+    
+    if (stage) {
+        strncpy(safe_stage, stage, sizeof(safe_stage) - 1);
+        safe_stage[sizeof(safe_stage) - 1] = '\0';
+    } else {
+        safe_stage[0] = '\0';
+    }
+    
+    // Build filename safely
+    if (strlen(safe_stage) > 0) {
+        snprintf(backup_file, sizeof(backup_file), "%s/%s_%.50s_%.20s.cfg", 
+                 CONFIG_BACKUP_DIR, timestamp, safe_api_name, safe_stage);
+    } else {
+        snprintf(backup_file, sizeof(backup_file), "%s/%s_%.50s.cfg", 
+                 CONFIG_BACKUP_DIR, timestamp, safe_api_name);
+    }
+    
+    // Use direct file operations instead of system() to avoid truncation
+    FILE *src = fopen(CONFIG_PATH, "rb");
+    FILE *dst = fopen(backup_file, "wb");
+    
+    if (src && dst) {
+        char buffer[50000];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+            fwrite(buffer, 1, bytes, dst);
+        }
+        fclose(src);
+        fclose(dst);
+        printf("[BACKUP] %s: %s -> %s\n", api_name, stage ? stage : "snapshot", backup_file);
+    } else {
+        printf("[BACKUP] Failed to backup config\n");
+        if (src) fclose(src);
+        if (dst) fclose(dst);
+    }
+}
+
+// Log current users state
+static void log_users_state_for_api(const char *api_name, const char *stage) {
+    FILE *file = fopen(CONFIG_PATH, "r");
+    if (!file) {
+        printf("[USER_LOG] Cannot open config file for reading\n");
+        return;
+    }
+    
+    char line[50000];
+    int found_users = 0;
+    char users_line[50000] = {0};
+    
+    // Find users line
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, "users ", 6) == 0) {
+            found_users = 1;
+            strncpy(users_line, line, sizeof(users_line) - 1);
+            users_line[sizeof(users_line) - 1] = '\0';
+            break;
+        }
+    }
+    fclose(file);
+    
+    if (!found_users) {
+        printf("[USER_LOG] %s (%s): NO USERS LINE FOUND!\n", api_name, stage);
+        
+        // Log this critical error
+        char log_file[999];
+        snprintf(log_file, sizeof(log_file), "%s/user_changes/errors.log", LOG_DIR);
+        
+        FILE *fp = fopen(log_file, "a");
+        if (fp) {
+            char timestamp[32];
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+            fprintf(fp, "[%s] %s (%s): NO USERS LINE!\n", timestamp, api_name, stage);
+            fclose(fp);
+        }
+        return;
+    }
+    
+    // Remove newline
+    users_line[strcspn(users_line, "\n")] = '\0';
+    
+    // Count users
+    int user_count = 0;
+    char *ptr = users_line + 6; // Skip "users "
+    while (*ptr) {
+        while (*ptr == ' ' || *ptr == '\t') ptr++;
+        if (!*ptr) break;
+        
+        // Find end of this user entry
+        char *entry_start = ptr;
+        while (*ptr && *ptr != ' ' && *ptr != '\t') ptr++;
+        
+        // Check if it's a valid user entry (contains :CL:)
+        char entry[50000];
+        size_t entry_len = ptr - entry_start;
+        if (entry_len < sizeof(entry)) {
+            strncpy(entry, entry_start, entry_len);
+            entry[entry_len] = '\0';
+            
+            if (strstr(entry, ":CL:") != NULL) {
+                user_count++;
+            }
+        }
+        
+        while (*ptr == ' ' || *ptr == '\t') ptr++;
+    }
+    
+    // Log to file
+    char log_file[999];
+    snprintf(log_file, sizeof(log_file), "%s/user_changes/%s.log", LOG_DIR, api_name);
+    
+    FILE *fp = fopen(log_file, "a");
+    if (fp) {
+        char timestamp[32];
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+        
+        fprintf(fp, "[%s] %s | Users: %d | Line: %s\n", 
+                timestamp, stage, user_count, users_line);
+        fclose(fp);
+    }
+    
+    printf("[USER_LOG] %s (%s): %d users\n", api_name, stage, user_count);
+}
+
+// Check if API modifies config (for selective logging)
+static int does_api_modify_config(const char *uri) {
+    // List of APIs that modify 3proxy.cfg
+    const char *modifying_apis[] = {
+        "/delete-proxies",
+        "/regenerate-proxy",
+        "/create-proxy",
+        "/change-proxy-ip",
+        "/change-protocol",
+        "/remove-blacklist",
+        "/add-blacklist",
+        "/manage-blacklist",
+        "/update-blacklist",
+        NULL
+    };
+    
+    for (int i = 0; modifying_apis[i] != NULL; i++) {
+        if (strcmp(uri, modifying_apis[i]) == 0) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+// Main logging function - call this for EVERY API
+static void log_api_with_config_backup(const char *method, const char *uri, 
+                                      struct mg_connection *c, struct mg_http_message *hm) {
+    ensure_log_directories();
+    
+    // Get client IP
+    char client_ip[64] = "unknown";
+    const char *ip = get_client_ip_from_connection(c);
+    if (ip) strncpy(client_ip, ip, sizeof(client_ip) - 1);
+    
+    // Get API name
+    const char *api_name = get_api_name(uri);
+    
+    // Create timestamp
+    char timestamp[32];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    // Log API call
+    char log_file[999];
+    char date_str[999];
+    strftime(date_str, sizeof(date_str), "%Y%m%d", tm_info);
+    snprintf(log_file, sizeof(log_file), "%s/api_calls/%s.log", LOG_DIR, date_str);
+    
+    FILE *fp = fopen(log_file, "a");
+    if (fp) {
+        fprintf(fp, "[%s] %s %s from %s\n", timestamp, method, uri, client_ip);
+        
+        // For POST requests, log request body (truncated)
+        if (hm->body.len > 0 && strcmp(method, "POST") == 0) {
+            char body_preview[50000];
+            size_t preview_len = hm->body.len > 500 ? 500 : hm->body.len;
+            snprintf(body_preview, sizeof(body_preview), "%.*s", (int)preview_len, hm->body.buf);
+            
+            // Clean up newlines for logging
+            for (char *p = body_preview; *p; p++) {
+                if (*p == '\n' || *p == '\r') *p = ' ';
+            }
+            
+            fprintf(fp, "  Request: %s", body_preview);
+            if (hm->body.len > preview_len) {
+                fprintf(fp, "... [TRUNCATED]");
+            }
+            fprintf(fp, "\n");
+        }
+        
+        fprintf(fp, "---\n");
+        fclose(fp);
+    }
+    
+    printf("\n=== API CALL: %s %s ===\n", method, uri);
+    printf("Client: %s\n", client_ip);
+    printf("Time: %s\n", timestamp);
+    
+    // Check if this API modifies config
+    if (does_api_modify_config(uri)) {
+        printf("*** CONFIG-MODIFYING API DETECTED ***\n");
+        
+        // Backup config BEFORE API execution
+        backup_config_with_api_info(api_name, "before");
+        
+        // Log users state BEFORE
+        log_users_state_for_api(api_name, "BEFORE");
+        
+        // Create snapshot before
+        char snapshot_file[999];
+        snprintf(snapshot_file, sizeof(snapshot_file), "%s/config_snapshots/%s_before_%s.cfg", 
+                 LOG_DIR, api_name, timestamp);
+        char cmd[9999];
+        snprintf(cmd, sizeof(cmd), "cp -f '%s' '%s'", CONFIG_PATH, snapshot_file);
+        system(cmd);
+        
+        // Set a flag to backup AFTER execution
+        // We'll do this by setting a context or using a global
+        // For simplicity, we'll handle it in each API handler or use a wrapper
+        
+    } else {
+        printf("Non-config-modifying API\n");
+    }
+}
+
+// Function to be called AFTER config-modifying API completes
+static void log_api_completion(const char *uri, int success) {
+    const char *api_name = get_api_name(uri);
+    
+    if (does_api_modify_config(uri)) {
+        printf("*** API COMPLETED: %s ***\n", uri);
+        
+        // Backup config AFTER API execution
+        backup_config_with_api_info(api_name, "after");
+        
+        // Log users state AFTER
+        log_users_state_for_api(api_name, "AFTER");
+        
+        // Compare before/after and log differences
+        compare_config_snapshots(api_name);
+        
+        printf("=== API COMPLETED SUCCESSFULLY ===\n\n");
+    }
+}
+
+static void compare_config_snapshots(const char *api_name) {
+    // Find the latest before and after snapshots
+    char before_path[512], after_path[512];
+    char before_file[512] = {0};
+    char after_file[512] = {0};
+    
+    // Build search patterns safely
+    snprintf(before_path, sizeof(before_path), "%s/config_snapshots", LOG_DIR);
+    snprintf(after_path, sizeof(after_path), "%s/config_snapshots", LOG_DIR);
+    
+    // Use find command with proper escaping
+    char cmd[1024];
+    FILE *fp;
+    
+    // Get latest before file
+    snprintf(cmd, sizeof(cmd), 
+             "find '%s' -name '*_before_*.cfg' 2>/dev/null | sort -r | head -1", 
+             before_path);
+    
+    fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(before_file, sizeof(before_file), fp)) {
+            before_file[strcspn(before_file, "\n")] = '\0';
+        }
+        pclose(fp);
+    }
+    
+    // Get latest after file
+    snprintf(cmd, sizeof(cmd), 
+             "find '%s' -name '*_after_*.cfg' 2>/dev/null | sort -r | head -1", 
+             after_path);
+    
+    fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(after_file, sizeof(after_file), fp)) {
+            after_file[strcspn(after_file, "\n")] = '\0';
+        }
+        pclose(fp);
+    }
+    
+    // If we have both files, compare users lines
+    if (before_file[0] && after_file[0]) {
+        // Extract users lines
+        char before_users[4096] = {0};
+        char after_users[4096] = {0};
+        
+        // Read before file users line
+        FILE *before_fp = fopen(before_file, "r");
+        if (before_fp) {
+            char line[50000];
+            while (fgets(line, sizeof(line), before_fp)) {
+                if (strncmp(line, "users ", 6) == 0) {
+                    strncpy(before_users, line, sizeof(before_users) - 1);
+                    break;
+                }
+            }
+            fclose(before_fp);
+        }
+        
+        // Read after file users line
+        FILE *after_fp = fopen(after_file, "r");
+        if (after_fp) {
+            char line[50000];
+            while (fgets(line, sizeof(line), after_fp)) {
+                if (strncmp(line, "users ", 6) == 0) {
+                    strncpy(after_users, line, sizeof(after_users) - 1);
+                    break;
+                }
+            }
+            fclose(after_fp);
+        }
+        
+        // Remove newlines
+        if (before_users[0]) before_users[strcspn(before_users, "\n")] = '\0';
+        if (after_users[0]) after_users[strcspn(after_users, "\n")] = '\0';
+        
+        // Log comparison
+        if (before_users[0] && after_users[0] && strcmp(before_users, after_users) != 0) {
+            printf("[CONFIG_CHANGE] Users line changed by %s\n", api_name);
+            printf("  Before: %s\n", before_users);
+            printf("  After:  %s\n", after_users);
+            
+            // Count users
+            int before_count = count_users_in_line(before_users);
+            int after_count = count_users_in_line(after_users);
+            
+            if (before_count != after_count) {
+                printf("[USER_COUNT_CHANGE] Users changed from %d to %d (%+d)\n", 
+                       before_count, after_count, after_count - before_count);
+                
+                // Log to special file
+                char diff_file[512];
+                time_t now = time(NULL);
+                struct tm *tm_info = localtime(&now);
+                char timestamp[32];
+                strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
+                
+                snprintf(diff_file, sizeof(diff_file), "%s/user_changes/diff_%s_%s.log", 
+                         LOG_DIR, api_name, timestamp);
+                
+                FILE *diff_fp = fopen(diff_file, "w");
+                if (diff_fp) {
+                    fprintf(diff_fp, "API: %s\n", api_name);
+                    fprintf(diff_fp, "Time: %s\n", timestamp);
+                    fprintf(diff_fp, "Users before: %d\n", before_count);
+                    fprintf(diff_fp, "Users after:  %d\n", after_count);
+                    fprintf(diff_fp, "Change: %+d\n", after_count - before_count);
+                    fprintf(diff_fp, "\nBefore: %s\n", before_users);
+                    fprintf(diff_fp, "After:  %s\n", after_users);
+                    fclose(diff_fp);
+                }
+            }
+        } else if (before_users[0] && after_users[0]) {
+            printf("[CONFIG_CHANGE] Users line unchanged by %s\n", api_name);
+        }
+    }
+}
+
+// Helper to count users in a line
+static int count_users_in_line(const char *users_line) {
+    if (!users_line || strlen(users_line) < 6) return 0;
+    
+    int count = 0;
+    const char *ptr = users_line + 6; // Skip "users "
+    
+    while (*ptr) {
+        // Skip whitespace
+        while (*ptr == ' ' || *ptr == '\t') ptr++;
+        if (!*ptr) break;
+        
+        // Find end of this entry
+        const char *entry_start = ptr;
+        while (*ptr && *ptr != ' ' && *ptr != '\t') ptr++;
+        
+        // Check if it's a valid entry (contains :CL:)
+        size_t entry_len = ptr - entry_start;
+        if (entry_len > 0) {
+            char entry[50000];
+            strncpy(entry, entry_start, entry_len < sizeof(entry) ? entry_len : sizeof(entry)-1);
+            entry[entry_len < sizeof(entry) ? entry_len : sizeof(entry)-1] = '\0';
+            
+            if (strstr(entry, ":CL:") != NULL) {
+                count++;
+            }
+        }
+        
+        // Skip whitespace for next entry
+        while (*ptr == ' ' || *ptr == '\t') ptr++;
+    }
+    
+    return count;
+}
+
 static void run_command(char *command) {
   // Open a pipe to run the command
   FILE *fp = popen(command, "r");
@@ -129,7 +654,7 @@ static void run_command(char *command) {
   }
 
   // Read the output from the command
-  char buffer[128];
+  char buffer[50000];
   while (fgets(buffer, sizeof(buffer), fp) != NULL) {
       printf("%s", buffer); // Print each line of output
   }
@@ -394,7 +919,7 @@ static char* convert_to_valid_json(const char* input) {
 }
 
 char* test_proxy(const char* proxy, const char* tipo) {
-    char command[512];
+    char command[50000];
     char *output = malloc(MAX_RESPONSE_LEN);
     if (!output) return NULL;
     
@@ -642,7 +1167,7 @@ void generate_ipv6_suffix(char *suffix) {
 
 void generate_ipv6_addresses(int count, const char *interface, char **ipv6list) {
     FILE *fp;
-    char command[256];
+    char command[50000];
     char ip6_prefix[64] = "";
     char suffix[64];
     
@@ -751,7 +1276,7 @@ static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message
     json_object_put(parsed_json);
     json_tokener_free(tokener);
 
-    char *ipv6list[10000];
+    char *ipv6list[50000];
     
     // Generate addresses
     generate_ipv6_addresses(count, interface, ipv6list);
@@ -761,7 +1286,7 @@ static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message
     json_object_object_add(response, "status", json_object_new_string("success"));
     
     // Create message using snprintf
-    char message[256];
+    char message[50000];
     snprintf(message, sizeof(message), "Generated %d IPv6 addresses for interface %s", count, interface);
     json_object_object_add(response, "message", json_object_new_string(message));
     
@@ -785,7 +1310,7 @@ static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message
 }
 
 static int ping_ipv6_with_result(const char *ipv6_address, char **error_message) {
-    char command[256];
+    char command[50000];
     snprintf(command, sizeof(command), "ping6 -c 1 -W 1 %s 2>&1", ipv6_address);
     
     FILE *fp = popen(command, "r");
@@ -795,7 +1320,7 @@ static int ping_ipv6_with_result(const char *ipv6_address, char **error_message)
     }
     
     // Read the output
-    char buffer[128];
+    char buffer[50000];
     char *output = NULL;
     size_t output_size = 0;
     
@@ -931,7 +1456,7 @@ static void get_traffic(char **dump_out, char *sid)
 
   size_t total_length = 0, dump_out_size = DUMP_REALLOC_SIZE;
 
-  char command[256];
+  char command[50000];
   snprintf(command, sizeof(command), "bng-cmd show traffic sid=%s", sid);
   // Open a pipe to run the command
   FILE *fp = popen(command, "r");
@@ -975,7 +1500,7 @@ static void get_ping(char **dump_out, char *clientip, int count)
 
   size_t total_length = 0, dump_out_size = DUMP_REALLOC_SIZE;
 
-  char command[256];
+  char command[50000];
   snprintf(command, sizeof(command), "vppctl ping %s source WanEthernet1/0/0 repeat %d", clientip, count);
   // Open a pipe to run the command
   FILE *fp = popen(command, "r");
@@ -1005,7 +1530,7 @@ static void get_ping(char **dump_out, char *clientip, int count)
 
 // Helper function to ping an IPv4 address and return the result
 static int ping_ipv4_with_result(const char *ipv4_address, char **error_message) {
-    char command[256];
+    char command[50000];
     snprintf(command, sizeof(command), "ping -c 1 -W 1 %s 2>&1", ipv4_address);
     
     FILE *fp = popen(command, "r");
@@ -1015,7 +1540,7 @@ static int ping_ipv4_with_result(const char *ipv4_address, char **error_message)
     }
     
     // Read the output
-    char buffer[128];
+    char buffer[50000];
     char *output = NULL;
     size_t output_size = 0;
     
@@ -1172,7 +1697,7 @@ static void debug_ipv6_status(const char* ipv6_address) {
     printf("\n=== IPv6 DEBUG INFO for %s ===\n", ipv6_address);
     
     // Check if IP exists
-    char cmd[512];
+    char cmd[50000];
     snprintf(cmd, sizeof(cmd), "ip -6 addr show | grep -A 5 -B 5 '%s'", ipv6_address);
     printf("Current IP status:\n");
     system(cmd);
@@ -1190,8 +1715,8 @@ static int remove_ipv6_address(const char* ipv6_address) {
     printf("Removing IPv6 address: %s\n", ipv6_address);
     
     // Method 1: First try to find and remove the exact address as shown in system
-    char check_cmd[512];
-    char remove_cmd[512];
+    char check_cmd[50000];
+    char remove_cmd[50000];
     int result = -1;
     
     // Get the exact IP address with prefix from system
@@ -1280,13 +1805,13 @@ static int remove_ipv4_address(const char* ipv4_address) {
         return -1;
     }
     
-    char line[512];
+    char line[50000];
     int found = 0;
     
     while (fgets(line, sizeof(line), fp)) {
         int index = 0;
-        char iface[64] = "";
-        char family[16] = "";
+        char iface[999] = "";
+        char family[999] = "";
         char address_with_prefix[64] = "";
         
         if (sscanf(line, "%d: %63s %15s %63s", &index, iface, family, address_with_prefix) != 4) {
@@ -1305,7 +1830,7 @@ static int remove_ipv4_address(const char* ipv4_address) {
         if (slash) *slash = '\0';
         
         if (strcmp(addr_only, ipv4_address) == 0) {
-            char command[256];
+            char command[50000];
             snprintf(command, sizeof(command), "ip addr del %s dev %s 2>/dev/null", address_with_prefix, iface);
             int result = system(command);
             if (result == 0) {
@@ -1322,7 +1847,7 @@ static int remove_ipv4_address(const char* ipv4_address) {
     
     if (!found) {
         // Treat as success if the address is no longer present
-        char check_cmd[256];
+        char check_cmd[50000];
         snprintf(check_cmd, sizeof(check_cmd), "ip -4 addr show | grep -q '%s'", ipv4_address);
         if (system(check_cmd) != 0) {
             printf("IPv4 address %s not found on any interface. Assuming removed.\n", ipv4_address);
@@ -1415,7 +1940,8 @@ static int restart_3proxy_service() {
 }
 
 // Function to delete proxies from 3proxy configuration - FIXED VERSION
-static int delete_proxies_from_config(const char** usernames, int count, char** deleted_users, int* deleted_count, char** removed_ipv6_addresses, int* ipv6_count, char** removed_ipv4_addresses, int* ipv4_count) {
+static int delete_proxies_from_config(const char** usernames, int count, const char** deleted_users, int* deleted_count,  char** removed_ipv6_addresses, int* ipv6_count, char** removed_ipv4_addresses, int* ipv4_count) {
+
     printf("Starting delete_proxies_from_config\n");
     
     // Read the config file
@@ -1435,11 +1961,11 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
     
     *ipv6_count = 0;
     *ipv4_count = 0;
-    char line[40960];
+    char line[50000];
     int in_proxy_block = 0;
     int skip_block = 0;
-    char current_user[128] = "";
-    char block_buffer[81920] = ""; // Increased buffer size
+    char current_user[50000] = "";
+    char block_buffer[50000] = ""; // Increased buffer size
     size_t block_pos = 0;
     int found_auth_in_block = 0;
     
@@ -1595,13 +2121,13 @@ static int delete_proxies_from_config(const char** usernames, int count, char** 
                     while (*user_end && *user_end != ' ' && *user_end != '\t') user_end++;
                     
                     if (user_end > current) {
-                        char user_entry[256];
+                        char user_entry[50000];
                         size_t entry_len = user_end - current;
                         strncpy(user_entry, current, entry_len);
                         user_entry[entry_len] = '\0';
                         
                         // Extract username
-                        char username[128];
+                        char username[50000];
                         strncpy(username, user_entry, sizeof(username) - 1);
                         username[sizeof(username) - 1] = '\0';
                         
@@ -1757,7 +2283,7 @@ static void handle_delete_proxies(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    const char **deleted_usernames = malloc(array_len * sizeof(char*));
+    char **deleted_usernames = malloc(array_len * sizeof(char*));
     memset(deleted_usernames, 0, array_len * sizeof(char*));
     if (!usernames) {
         printf("Memory allocation failed for deleted_usernames array\n");
@@ -2053,7 +2579,7 @@ static char* find_proxy_ip_by_port(const char *config_content, int target_port) 
             line[line_len] = '\0';
 
             int found_port = -1;
-            char ip_candidate[256];
+            char ip_candidate[50000];
             ip_candidate[0] = '\0';
 
             char *saveptr = NULL;
@@ -2227,7 +2753,7 @@ static char* update_proxy_ip_in_config(const char *config_content, int target_po
 // Function to write 3proxy configuration
 static int write_3proxy_config(const char *content) {
     printf("Writing 3proxy config...\n");
-    char backup_cmd[256];
+    char backup_cmd[50000];
     snprintf(backup_cmd, sizeof(backup_cmd), "cp %s %s.backup", CONFIG_PATH, CONFIG_PATH);
     system(backup_cmd);
     
@@ -2291,34 +2817,34 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     // Common authentication and access control
     strcat(config, "flush\ninclude /conf/blacklist.txt\n");
     
-    char allow_line[256];
+    char allow_line[50000];
     snprintf(allow_line, sizeof(allow_line), "allow %s\n", username);
     strcat(config, allow_line);
     
     // Generate specific proxy configuration based on type
     if (strcmp(proxy_type, "socks-ipv6") == 0) {
-        char proxy_line[256];
+        char proxy_line[50000];
         snprintf(proxy_line, sizeof(proxy_line), "socks -64 -p%d -i%s -e%s\n", 
                 port, host, external_ip);
         strcat(config, proxy_line);
         printf("Generated SOCKS5 IPv6 config");
     }
     else if (strcmp(proxy_type, "proxy-ipv6") == 0) {
-        char proxy_line[256];
+        char proxy_line[50000];
         snprintf(proxy_line, sizeof(proxy_line), "proxy -64 -p%d -i%s -e%s\n", 
                 port, host, external_ip);
         strcat(config, proxy_line);
         printf("Generated HTTP IPv6 config");
     }
     else if (strcmp(proxy_type, "proxy-ipv4") == 0) {
-        char proxy_line[256];
+        char proxy_line[50000];
         snprintf(proxy_line, sizeof(proxy_line), "proxy -p%d -i%s -e%s\n", 
                 port, host, external_ip);
         strcat(config, proxy_line);
         printf("Generated HTTP IPv4 config");
     }
     else if (strcmp(proxy_type, "socks-ipv4") == 0) {
-        char proxy_line[256];
+        char proxy_line[50000];
         snprintf(proxy_line, sizeof(proxy_line), "socks -p%d -i%s -e%s\n", 
                 port, host, external_ip);
         strcat(config, proxy_line);
@@ -2326,16 +2852,16 @@ static char* generate_proxy_config(const char *proxy_type, const char *host, int
     }
     else if (strcmp(proxy_type, "parent") == 0 && parent_info) {
         // Parse parent info: "parent_ip parent_port parent_user parent_pass"
-        char parent_ip[64], parent_user[64], parent_pass[64];
+        char parent_ip[50000], parent_user[50000], parent_pass[50000];
         int parent_port;
         
         if (sscanf(parent_info, "%63s %d %63s %63s", parent_ip, &parent_port, parent_user, parent_pass) == 4) {
-            char parent_line[256];
+            char parent_line[50000];
             snprintf(parent_line, sizeof(parent_line), "parent 1000 socks5 %s %d %s %s\n", 
                     parent_ip, parent_port, parent_user, parent_pass);
             strcat(config, parent_line);
             
-            char socks_line[256];
+            char socks_line[50000];
             snprintf(socks_line, sizeof(socks_line), "socks -p%d\n", port);
             strcat(config, socks_line);
         }
@@ -2397,7 +2923,7 @@ static char* update_users_line(const char *current_config, const char *username,
     //printf("DEBUG: Users line content: '%.*s'\n", (int)users_line_len, users_start);
     
     // Check if user already exists
-    char user_search[128];
+    char user_search[50000];
     int search_result = snprintf(user_search, sizeof(user_search), " %s:", username);
     if (search_result < 0 || search_result >= (int)sizeof(user_search)) {
         printf("ERROR: User search pattern too long\n");
@@ -2601,7 +3127,7 @@ static int delete_proxy_by_username_simple(const char *username) {
             block_segment[block_end - block_start] = '\0';
             
             // Look for "allow username" in this block
-            char allow_pattern[99999];
+            char allow_pattern[50000];
             snprintf(allow_pattern, sizeof(allow_pattern), "allow %s\n", username);
             if (strstr(block_segment, allow_pattern) != NULL) {
                 // Skip this block - don't copy it to new config
@@ -2625,7 +3151,7 @@ static int delete_proxy_by_username_simple(const char *username) {
                 // Rebuild users line without the target user
                 printf("Rebuilding users line without %s\n", username);
                 
-                char new_users_line[99999] = "users";
+                char new_users_line[50000] = "users";
                 char *token;
                 char *rest = users_line + 5; // Skip "users"
                 
@@ -2634,7 +3160,7 @@ static int delete_proxy_by_username_simple(const char *username) {
                 
                 char *token_rest = rest;
                 while ((token = strtok_r(token_rest, " \t", &token_rest))) {
-                    char user_part[99999];
+                    char user_part[50000];
                     strncpy(user_part, token, sizeof(user_part) - 1);
                     user_part[sizeof(user_part) - 1] = '\0';
                     
@@ -2783,7 +3309,7 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         printf("Processing proxy: %s\n", proxy_str);
         
         // Parse proxy string: "host:port:username:password external_ip [parent_info]"
-        char host[64], username[64], password[64], external_ip[64], parent_info[256];
+        char host[564], username[564], password[564], external_ip[564], parent_info[756];
         int port;
         
         parent_info[0] = '\0';
@@ -2823,7 +3349,7 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         
         // Check if proxy exists but is broken
         int proxy_exists = 0;
-        char allow_pattern[256];
+        char allow_pattern[50000];
         snprintf(allow_pattern, sizeof(allow_pattern), "allow %s", username);
         if (strstr(new_config, allow_pattern) != NULL) {
             proxy_exists = 1;
@@ -2855,7 +3381,7 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
             int is_ipv6_addr = strchr(external_ip, ':') != NULL;
             const char *ip_version = is_ipv6_addr ? "IPv6" : "IPv4";
             printf("Adding %s address to interface...\n", ip_version);
-            char error_msg[256];
+            char error_msg[50000];
             if (!add_ip_to_interface(external_ip, interface, is_ipv6_addr, error_msg, sizeof(error_msg))) {
                 printf("Warning: Failed to add %s address %s to interface %s, msg: %s\n", 
                        ip_version, external_ip, interface, error_msg);
@@ -2939,7 +3465,7 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         json_object *response_obj = json_object_new_object();
         json_object_object_add(response_obj, "status", json_object_new_string("success"));
         
-        char message[512];
+        char message[50000];
         if (broken_fixed_count > 0) {
             snprintf(message, sizeof(message), 
                     "Processed %d proxies: %d regenerated, %ld failed", 
@@ -2997,7 +3523,7 @@ static void printMg(struct mg_str *mgstr) {
 }
 
 static int block_port(int port) {
-    char command[256];
+    char command[50000];
     snprintf(command, sizeof(command), "ufw deny %d/tcp 2>/dev/null", port);
     int result = system(command);
     return (result == 0);
@@ -3005,7 +3531,7 @@ static int block_port(int port) {
 
 // Function to unblock a port using ufw
 static int unblock_port(int port) {
-    char command[256];
+    char command[50000];
     snprintf(command, sizeof(command), "ufw allow %d/tcp 2>/dev/null", port);
     int result = system(command);
     return (result == 0);
@@ -3013,7 +3539,7 @@ static int unblock_port(int port) {
 
 // Function to check if a port is blocked
 static int is_port_blocked(int port) {
-    char command[256];
+    char command[50000];
     snprintf(command, sizeof(command), "ufw status | grep -E '^%d/tcp.*DENY' > /dev/null", port);
     int result = system(command);
     return (result == 0);
@@ -3396,7 +3922,7 @@ static void handle_ports_status(struct mg_connection *c, struct mg_http_message 
 }
 
 static int remove_ip_from_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size) {
-    char command[256];
+    char command[50000];
     
     if (is_ipv6) {
         // First try to remove with /128 prefix
@@ -3463,7 +3989,7 @@ static int remove_ip_from_interface(const char *ip_address, const char *interfac
 
 // Function to add IP address to interface
 static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size) {
-    char command[256];
+    char command[50000];
     
     if (is_ipv6) {
         snprintf(command, sizeof(command), "ip -6 addr add %s/128 dev %s 2>&1", ip_address, interface);
@@ -3622,7 +4148,7 @@ static void handle_add_ip_address(struct mg_connection *c, struct mg_http_messag
     int is_ipv6 = is_ipv6_address(address);
     const char *ip_type = is_ipv6 ? "IPv6" : "IPv4";
     
-    char error_msg[256];
+    char error_msg[50000];
     // Add the IP address to the interface
     if (add_ip_to_interface(address, interface, is_ipv6, error_msg, sizeof(error_msg))) {
       json_object *result_obj = json_object_new_object();
@@ -3740,7 +4266,7 @@ static void handle_blacklist_post(struct mg_connection *c, struct mg_http_messag
         return;
     }
     
-    char buffer[256];
+    char buffer[50000];
     while (fgets(buffer, sizeof(buffer), file) && line_count < MAX_BLACKLIST_LINES) {
         // Remove newline
         buffer[strcspn(buffer, "\n")] = 0;
@@ -3878,7 +4404,7 @@ static void handle_blacklist_post(struct mg_connection *c, struct mg_http_messag
     }
     
     // Build response message based on action and results
-    char message[512];
+    char message[50000];
     if (strcmp(action, "add") == 0) {
         int added_count = json_object_array_length(added_list);
         int exists_count = json_object_array_length(exists_list);
@@ -3900,7 +4426,7 @@ static void handle_blacklist_post(struct mg_connection *c, struct mg_http_messag
         }
         
         if (error_count > 0) {
-            char error_msg[256];
+            char error_msg[50000];
             snprintf(error_msg, sizeof(error_msg), 
                      ", %d domains had errors", error_count);
             strncat(message, error_msg, sizeof(message) - strlen(message) - 1);
@@ -3927,7 +4453,7 @@ static void handle_blacklist_post(struct mg_connection *c, struct mg_http_messag
         }
         
         if (error_count > 0) {
-            char error_msg[256];
+            char error_msg[50000];
             snprintf(error_msg, sizeof(error_msg), 
                      ", %d domains had errors", error_count);
             strncat(message, error_msg, sizeof(message) - strlen(message) - 1);
@@ -3994,7 +4520,7 @@ static int validate_binary(const char *path) {
 // Function to safely copy file
 static int copy_file(const char *src, const char *dst) {
     int src_fd, dst_fd;
-    char buffer[8192];
+    char buffer[50000];
     ssize_t bytes;
     
     src_fd = open(src, O_RDONLY);
@@ -4093,7 +4619,7 @@ static void handle_update(struct mg_connection *c, struct mg_http_message *hm) {
     
      // 7. Create backup using install command
     const char *backup_path = "/tmp/app2proxy-backup";
-    char backup_cmd[512];
+    char backup_cmd[50000];
     snprintf(backup_cmd, sizeof(backup_cmd), "install -m 0755 -p %s %s", CURRENT_BINARY_PATH, backup_path);
     
     if (system(backup_cmd) != 0) {
@@ -4106,12 +4632,12 @@ static void handle_update(struct mg_connection *c, struct mg_http_message *hm) {
     printf("Backup created at %s\n", backup_path);
     
     // 8. Install new binary using install command
-    char install_cmd[512];
+    char install_cmd[50000];
     snprintf(install_cmd, sizeof(install_cmd), "install -m 0755 -p %s %s", temp_path, CURRENT_BINARY_PATH);
     
     if (system(install_cmd) != 0) {
         // Restore backup if installation fails
-        char restore_cmd[512];
+        char restore_cmd[50000];
         snprintf(restore_cmd, sizeof(restore_cmd), "install -m 0755 -p %s %s", backup_path, CURRENT_BINARY_PATH);
         system(restore_cmd);
         
@@ -4238,7 +4764,7 @@ static char* find_old_ip_by_port(const char *config_content, int target_port) {
             line[line_len] = '\0';
             
             int found_port = -1;
-            char ip_candidate[256];
+            char ip_candidate[50000];
             ip_candidate[0] = '\0';
             
             char *saveptr = NULL;
@@ -4454,7 +4980,7 @@ static char* run_command_capture(const char *command, int *exit_code) {
     }
     out[0] = '\0';
 
-    char buf[256];
+    char buf[50000];
     while (fgets(buf, sizeof(buf), fp) != NULL) {
         size_t add = strlen(buf);
         if (len + add + 1 > cap) {
@@ -4640,7 +5166,7 @@ static void handle_blacklist_manage(struct mg_connection *c, struct mg_http_mess
         return;
     }
     
-    char buffer[1024];
+    char buffer[50000];
     while (fgets(buffer, sizeof(buffer), file) && line_count < MAX_BLACKLIST_LINES) {
         // Remove newline
         buffer[strcspn(buffer, "\n")] = 0;
@@ -4705,7 +5231,7 @@ static void handle_blacklist_manage(struct mg_connection *c, struct mg_http_mess
         }
         
         // Format the domain line according to the pattern
-        char domain_line[512];
+        char domain_line[50000];
         snprintf(domain_line, sizeof(domain_line), "deny * * %s", domain_input);
         
         // Check if domain line exists in current blacklist
@@ -4782,7 +5308,7 @@ static void handle_blacklist_manage(struct mg_connection *c, struct mg_http_mess
     }
     
     // Build response message based on action and results
-    char message[512];
+    char message[50000];
     if (strcmp(action, "add") == 0) {
         int added_count = json_object_array_length(added_list);
         int exists_count = json_object_array_length(exists_list);
@@ -4804,7 +5330,7 @@ static void handle_blacklist_manage(struct mg_connection *c, struct mg_http_mess
         }
         
         if (error_count > 0) {
-            char error_msg[256];
+            char error_msg[50000];
             snprintf(error_msg, sizeof(error_msg), 
                      ", %d domains had errors", error_count);
             strncat(message, error_msg, sizeof(message) - strlen(message) - 1);
@@ -4831,7 +5357,7 @@ static void handle_blacklist_manage(struct mg_connection *c, struct mg_http_mess
         }
         
         if (error_count > 0) {
-            char error_msg[256];
+            char error_msg[50000];
             snprintf(error_msg, sizeof(error_msg), 
                      ", %d domains had errors", error_count);
             strncat(message, error_msg, sizeof(message) - strlen(message) - 1);
@@ -4894,7 +5420,7 @@ static void handle_get_blacklist(struct mg_connection *c, struct mg_http_message
     struct json_object *root = json_object_new_object();
     struct json_object *domains_array = json_object_new_array();
     
-    char line[1024];
+    char line[50000];
     int line_count = 0;
     
     // Read blacklist file line by line
@@ -5164,7 +5690,7 @@ static void handle_change_protocol(struct mg_connection *c, struct mg_http_messa
         
         // Extract line
         size_t line_len = line_end - cursor;
-        char line[1024];
+        char line[50000];
         if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
         memcpy(line, cursor, line_len);
         line[line_len] = '\0';
@@ -5200,7 +5726,7 @@ static void handle_change_protocol(struct mg_connection *c, struct mg_http_messa
                 // Check if we actually need to change anything
                 if ((is_current_socks != want_socks) || (is_current_ipv6 != want_ipv6)) {
                     // Need to modify this line
-                    char new_line[1024] = "";
+                    char new_line[50000] = "";
                     
                     // Start with protocol
                     if (want_socks) {
@@ -5519,7 +6045,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
     int line_num = 0;
     
     // Store lines of current block temporarily
-    char block_lines[10][256];
+    char block_lines[100][50000];
     int block_line_count = 0;
     int current_block_has_blacklist = 0;
     int current_block_port = 0;
@@ -5550,7 +6076,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
         
         // Extract line
         size_t line_len = line_end - cursor;
-        char line[1024];
+        char line[50000];
         if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
         memcpy(line, cursor, line_len);
         line[line_len] = '\0';
@@ -5614,7 +6140,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
         // We're inside a proxy block
         else if (in_proxy_block) {
             // Store line in block buffer
-            if (block_line_count < 10) {
+            if (block_line_count < 100) {
                 strcpy(block_lines[block_line_count++], trimmed);
             }
             
@@ -5928,7 +6454,7 @@ static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message
     int line_num = 0;
     
     // Store lines of current block temporarily
-    char block_lines[10][256];
+    char block_lines[10][50000];
     int block_line_count = 0;
     int current_block_has_blacklist = 0;
     int current_block_port = 0;
@@ -5959,7 +6485,7 @@ static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message
         
         // Extract line
         size_t line_len = line_end - cursor;
-        char line[256];
+        char line[50000];
         if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
         memcpy(line, cursor, line_len);
         line[line_len] = '\0';
@@ -6208,6 +6734,16 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     printf("head: "); printMg(&hm->head);
     printf("message: "); printMg(&hm->message);*/
 
+    // Extract method and URI
+    char method[16];
+    char uri[256];
+    
+    mg_snprintf(method, sizeof(method), "%.*s", (int)hm->method.len, hm->method.buf);
+    mg_snprintf(uri, sizeof(uri), "%.*s", (int)hm->uri.len, hm->uri.buf);
+    
+    // Log EVERY API call with config backup (if needed)
+    log_api_with_config_backup(method, uri, c, hm);
+    
     if ( mg_match(hm->method, mg_str("GET"), NULL) ) {
       if( mg_match(hm->uri, mg_str("/traffic"), NULL) ) {
         char sid[128];
@@ -6317,7 +6853,7 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           struct json_object *root = json_object_new_object();
           struct json_object *entries_array = json_object_new_array();
           
-          char line[256];
+          char line[50000];
           int line_count = 0;
           
           // Read blacklist file line by line
@@ -6357,7 +6893,7 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
           return;
       }
       else if( mg_match(hm->uri, mg_str("/ping"), NULL) ) {
-        char query[256], clientip[MAX_IP_LENGTH];
+        char query[50000], clientip[MAX_IP_LENGTH];
         int count;
         if(hm->query.len) {
           int qlen = hm->query.len;
@@ -6391,99 +6927,107 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       return;
     }
     else if ( mg_match(hm->method, mg_str("POST"), NULL) ) {
+      // Track if this API modifies config
+      int modifies_config = 1; //does_api_modify_config(uri);
+      
+      if (modifies_config) {
+        
+      }
+      
       if (mg_match(hm->uri, mg_str("/test-proxies"), NULL)) {
         handle_test_proxies(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/generate-ipv6"), NULL)) {
         handle_generate_ipv6(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/ipv6-ping-test"), NULL)) {
         handle_ipv6_ping_test(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
-      if (mg_match(hm->uri, mg_str("/ipv4-ping-test"), NULL)) {
-          handle_ipv4_ping_test(c, hm);
-          return;
+      else if (mg_match(hm->uri, mg_str("/ipv4-ping-test"), NULL)) {
+        handle_ipv4_ping_test(c, hm);
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/delete-proxies"), NULL)) {
         handle_delete_proxies(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/regenerate-proxy"), NULL)) {
-          handle_regenerate_proxy(c, hm);
-          return;
+        handle_regenerate_proxy(c, hm);
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/create-proxy"), NULL)) {
-          handle_regenerate_proxy(c, hm);
-          return;
+        handle_regenerate_proxy(c, hm);
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/block"), NULL)) {
         handle_block_port(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/unblock"), NULL)) {
         handle_unblock_port(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/port-status"), NULL)) {
         handle_port_status(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/block-ports"), NULL)) {
         handle_block_ports(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/unblock-ports"), NULL)) {
         handle_unblock_ports(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/ports-status"), NULL)) {
         handle_ports_status(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/change-proxy-ip"), NULL)) {
         handle_update_proxy_ip(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/run-cmd"), NULL)) {
         handle_run_command(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/load-ipv6"), NULL)) {
         handle_add_ip_address(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/update-blacklist"), NULL)) {
         handle_blacklist_post(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/update"), NULL)) {
         handle_update(c, hm);
-        return;
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/manage-blacklist"), NULL)) {
-          handle_blacklist_manage(c, hm);
-          return;
+        handle_blacklist_manage(c, hm);
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/change-protocol"), NULL)) {
-          handle_change_protocol(c, hm);
-          return;
+        handle_change_protocol(c, hm);
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/remove-blacklist"), NULL)) {
-          handle_remove_blacklist(c, hm);
-          return;
+        handle_remove_blacklist(c, hm);
+        if (modifies_config) log_api_completion(uri, 1);
       }
       else if (mg_match(hm->uri, mg_str("/add-blacklist"), NULL)) {
-          handle_add_blacklist(c, hm);
-          return;
+        handle_add_blacklist(c, hm);
+        if (modifies_config) log_api_completion(uri, 0);
       }
       else {
         goto send_errmsg;
       }
       return;
     }
+    
 send_errmsg:
     mg_http_reply(c, 500, "", "{\"%m\":\"%m\"}\n", MG_ESC("error"), MG_ESC("Unsupported URI")); 
   }
