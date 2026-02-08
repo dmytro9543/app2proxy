@@ -2227,15 +2227,19 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
     if (!block_buffer) { fclose(file); fclose(temp_file); return -1; }
     size_t block_pos = 0;
     int found_auth_in_block = 0;
+    int need_blank_before_next_block = 0;  // Track if we need a blank line before next block
     
     // Read file line by line
     while (fgets(line, sizeof(line), file)) {
         // Remove newline
         line[strcspn(line, "\n")] = 0;
         
+        // Check if this is a blank line
+        int is_blank_line = (strlen(line) == 0);
+        
         // Check for proxy block header (comment lines starting with ####)
         if (strstr(line, "####") != NULL && !in_proxy_block) {
-            // This might be the start of a proxy block
+            // This is the start of a proxy block
             in_proxy_block = 1;
             skip_block = 0;
             current_user[0] = '\0';
@@ -2257,9 +2261,8 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
             continue;
         }
         
-        // Check if we're starting a proxy block with auth strong
+        // Check if we're starting a proxy block with flush
         if (strncmp(line, "flush", 5) == 0) {
-            // If we're already in a block (from a comment header), just mark that we found auth
             if (in_proxy_block) {
                 found_auth_in_block = 1;
             } else {
@@ -2325,9 +2328,9 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
             block_pos += len;
             block_buffer[block_pos++] = '\n';
         }
-        // Check for flush line (end of proxy block)
+        // Check for socks/proxy/parent line (end of proxy block)
         else if (in_proxy_block && (strncmp(line, "socks", 5) == 0 || strncmp(line, "proxy", 5) == 0 || strncmp(line, "parent", 6) == 0)) {
-            // Add flush line to block
+            // Add line to block
             size_t len = strlen(line);
             if (block_pos + len + 2 >= block_buffer_size) {
                 block_buffer_size = (block_pos + len + 2) * 2;
@@ -2339,7 +2342,7 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
             block_pos += len;
             block_buffer[block_pos++] = '\n';
             
-            // NOW extract IPv6 address from the COMPLETE block
+            // Extract IP address from the COMPLETE block if skipping
             if (skip_block) {
                 printf("Complete block for user %s:\n%s\n", current_user, block_buffer);
                 int block_is_ipv6 = 0;
@@ -2361,9 +2364,16 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
             
             // Write block if not skipped
             if (!skip_block) {
+                // Add ONE blank line before block (for separation from previous content)
+                if (need_blank_before_next_block) {
+                    fprintf(temp_file, "\n");
+                }
                 fwrite(block_buffer, 1, block_pos, temp_file);
+                need_blank_before_next_block = 1;  // Next block needs blank line before it
             } else {
                 printf("Skipping block for user %s\n", current_user);
+                // Don't change need_blank_before_next_block - next written block
+                // will still get a blank line if one was needed
             }
             
             in_proxy_block = 0;
@@ -2379,7 +2389,7 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
             size_t users_line_alloc = strlen(line) + 256;
             char *new_users_line = calloc(users_line_alloc, 1);
             if (!new_users_line) { free(block_buffer); fclose(file); fclose(temp_file); return -1; }
-            char *users_pos = line;  // we already matched strncmp above
+            char *users_pos = line;
             
             if (users_pos) {
                 strcpy(new_users_line, "users");
@@ -2424,7 +2434,6 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
                         }
                         
                         if (keep_user) {
-                            //if (!first_user) strcat(new_users_line, " ");
                             strcat(new_users_line, " ");
                             strcat(new_users_line, user_entry);
                             first_user = 0;
@@ -2445,26 +2454,34 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
         }
         // Regular line (not in proxy block)
         else if (!in_proxy_block) {
-            fprintf(temp_file, "%s\n", line);
-        }
-        // Line inside proxy block (including comment headers, auth, proxy/socks commands, etc.)
-        else if (in_proxy_block) {
-            // Add line to block buffer
-            size_t len = strlen(line);
-            if (block_pos + len + 2 >= block_buffer_size) {
-                block_buffer_size = (block_pos + len + 2) * 2;
-                char *tmp = realloc(block_buffer, block_buffer_size);
-                if (!tmp) { free(block_buffer); fclose(file); fclose(temp_file); return -1; }
-                block_buffer = tmp;
+            // Skip ALL blank lines - we control spacing between blocks ourselves
+            if (!is_blank_line) {
+                fprintf(temp_file, "%s\n", line);
             }
-            memcpy(block_buffer + block_pos, line, len);
-            block_pos += len;
-            block_buffer[block_pos++] = '\n';
+        }
+        // Line inside proxy block
+        else if (in_proxy_block) {
+            // Add line to block buffer (skip blank lines inside blocks too)
+            if (!is_blank_line) {
+                size_t len = strlen(line);
+                if (block_pos + len + 2 >= block_buffer_size) {
+                    block_buffer_size = (block_pos + len + 2) * 2;
+                    char *tmp = realloc(block_buffer, block_buffer_size);
+                    if (!tmp) { free(block_buffer); fclose(file); fclose(temp_file); return -1; }
+                    block_buffer = tmp;
+                }
+                memcpy(block_buffer + block_pos, line, len);
+                block_pos += len;
+                block_buffer[block_pos++] = '\n';
+            }
         }
     }
     
     // Handle any remaining block at end of file
     if (in_proxy_block && !skip_block && block_pos > 0) {
+        if (need_blank_before_next_block) {
+            fprintf(temp_file, "\n");
+        }
         fwrite(block_buffer, 1, block_pos, temp_file);
     } else if (in_proxy_block && skip_block) {
         printf("Skipping remaining block for user %s\n", current_user);
@@ -3382,7 +3399,7 @@ static char* update_users_line(const char *current_config, const char *username,
     return new_config;
 }
 
-// Delete proxy block by username - safe version (no VLAs, no O(nÃ‚Â²), atomic write)
+// Delete proxy block by username - safe version (no VLAs, no O(nÃƒâ€šÃ‚Â²), atomic write)
 static int delete_proxy_by_username_simple(const char *username) {
     printf("Deleting proxy for user: %s\n", username);
     
@@ -3400,7 +3417,7 @@ static int delete_proxy_by_username_simple(const char *username) {
         return -1;
     }
     
-    size_t out_pos = 0;  // efficient output position tracking (no O(nÃ‚Â²))
+    size_t out_pos = 0;  // efficient output position tracking (no O(nÃƒâ€šÃ‚Â²))
     new_config[0] = '\0';
     
     char *current = config;
@@ -6039,7 +6056,7 @@ static void handle_change_protocol(struct mg_connection *c, struct mg_http_messa
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated Ã¢â‚¬â€ no truncation)
+        // Extract line (dynamically allocated ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) {
@@ -6436,7 +6453,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated Ã¢â‚¬â€ no truncation)
+        // Extract line (dynamically allocated ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -6854,7 +6871,7 @@ static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated Ã¢â‚¬â€ no truncation)
+        // Extract line (dynamically allocated ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
