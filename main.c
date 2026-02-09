@@ -3819,12 +3819,11 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
             printf("Failed to generate proxy config for user %s\n", username);
             json_object_array_add(failed_users, json_object_new_string(username));
         }
-
-        write_3proxy_config(new_config);
     }
     
     // Write new configuration
     if (success_count > 0) {
+        write_3proxy_config(new_config);
         
         int restart_result = restart_3proxy_service();
         printf("Service restart result: %d\n", restart_result);
@@ -7510,4 +7509,3 @@ int main(int argc, char* argv[])
 
   return 0;
 }
-
