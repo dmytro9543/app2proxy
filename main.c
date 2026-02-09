@@ -36,7 +36,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.3.9"
+#define VERSION_STRING "1.3.10"
 
 int main_pid = 0;
 int no_fork = 0;
