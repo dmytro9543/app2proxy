@@ -99,6 +99,7 @@ static void handle_proxy_ip(struct mg_connection *c, struct mg_http_message *hm)
 static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_message *hm);
 static int get_query_param(const struct mg_str *query, const char *key, char *value, size_t value_size);
 static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size);
+static int is_ip_on_system(const char *ip_address);
 
 static void sig_usr_un(int signo)
 {
@@ -4148,6 +4149,23 @@ static void handle_block_ports(struct mg_connection *c, struct mg_http_message *
 }
 
 // HTTP handler to unblock multiple ports
+// Check if an IP address is already assigned on the system
+// Returns 1 if IP exists, 0 if not found, -1 on error
+static int is_ip_on_system(const char *ip_address) {
+    char command[512];
+    int is_ipv6 = (strchr(ip_address, ':') != NULL);
+    
+    if (is_ipv6) {
+        snprintf(command, sizeof(command), "ip -6 addr show | grep -q '%s'", ip_address);
+    } else {
+        snprintf(command, sizeof(command), "ip -4 addr show | grep -q 'inet %s[/ ]'", ip_address);
+    }
+    
+    int result = system(command);
+    printf("IP check: %s -> %s\n", ip_address, (result == 0) ? "exists" : "not found");
+    return (result == 0) ? 1 : 0;
+}
+
 static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message *hm) {
     // Parse JSON body
     char *body_str = malloc(hm->body.len + 1);
@@ -4169,7 +4187,7 @@ static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message
         return;
     }
     
-    // Extract ports array
+    // Extract ports array - now expects strings like "IP:port"
     json_object *ports_obj;
     if (!json_object_object_get_ex(root, "ports", &ports_obj) || 
         !json_object_is_type(ports_obj, json_type_array)) {
@@ -4179,41 +4197,115 @@ static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message
         return;
     }
     
+    // Extract optional interface (default: eth0)
+    json_object *interface_obj;
+    const char *interface = "eth0";
+    if (json_object_object_get_ex(root, "interface", &interface_obj) && 
+        json_object_is_type(interface_obj, json_type_string)) {
+        interface = json_object_get_string(interface_obj);
+    }
+    
     // Create response array
     json_object *response_array = json_object_new_array();
     int success_count = 0;
+    int ip_added_count = 0;
     int total_ports = json_object_array_length(ports_obj);
     
-    // Process each port
+    // Process each "IP:port" entry
     for (int i = 0; i < total_ports; i++) {
         json_object *port_item = json_object_array_get_idx(ports_obj, i);
         
-        if (!json_object_is_type(port_item, json_type_int)) {
+        if (!json_object_is_type(port_item, json_type_string)) {
             continue;
         }
         
-        int port = json_object_get_int(port_item);
+        const char *entry = json_object_get_string(port_item);
+        
+        // Parse "IP:port" - find the last ':' to handle IPv6 addresses
+        char ip_addr[256] = {0};
+        int port = 0;
+        
+        const char *last_colon = strrchr(entry, ':');
+        if (!last_colon || last_colon == entry) {
+            printf("Invalid IP:port format: %s\n", entry);
+            json_object *result_obj = json_object_new_object();
+            json_object_object_add(result_obj, "entry", json_object_new_string(entry));
+            json_object_object_add(result_obj, "status", json_object_new_string("error"));
+            json_object_object_add(result_obj, "message", json_object_new_string("Invalid IP:port format"));
+            json_object_array_add(response_array, result_obj);
+            continue;
+        }
+        
+        // Extract IP (everything before last colon) and port (everything after)
+        size_t ip_len = last_colon - entry;
+        if (ip_len >= sizeof(ip_addr)) ip_len = sizeof(ip_addr) - 1;
+        strncpy(ip_addr, entry, ip_len);
+        ip_addr[ip_len] = '\0';
+        port = atoi(last_colon + 1);
         
         // Validate port range
         if (port < 1 || port > 65535) {
+            printf("Invalid port number in entry: %s\n", entry);
+            json_object *result_obj = json_object_new_object();
+            json_object_object_add(result_obj, "entry", json_object_new_string(entry));
+            json_object_object_add(result_obj, "status", json_object_new_string("error"));
+            json_object_object_add(result_obj, "message", json_object_new_string("Invalid port range (1-65535)"));
+            json_object_array_add(response_array, result_obj);
             continue;
+        }
+        
+        // Check if IP exists on the system; if not, add it
+        int ip_existed = 1;
+        if (!is_ip_on_system(ip_addr)) {
+            ip_existed = 0;
+            int is_ipv6 = (strchr(ip_addr, ':') != NULL);
+            char error_msg[1024] = {0};
+            printf("IP %s not found on system, adding to interface %s\n", ip_addr, interface);
+            
+            if (!add_ip_to_interface(ip_addr, interface, is_ipv6, error_msg, sizeof(error_msg))) {
+                printf("Warning: Failed to add IP %s to interface %s: %s\n", ip_addr, interface, error_msg);
+                json_object *result_obj = json_object_new_object();
+                json_object_object_add(result_obj, "entry", json_object_new_string(entry));
+                json_object_object_add(result_obj, "ip", json_object_new_string(ip_addr));
+                json_object_object_add(result_obj, "port", json_object_new_int(port));
+                json_object_object_add(result_obj, "status", json_object_new_string("error"));
+                json_object_object_add(result_obj, "message", json_object_new_string(error_msg));
+                json_object_array_add(response_array, result_obj);
+                continue;
+            } else {
+                printf("Successfully added IP %s to interface %s: %s\n", ip_addr, interface, error_msg);
+                ip_added_count++;
+            }
+        } else {
+            printf("IP %s already exists on system\n", ip_addr);
         }
         
         // Unblock the port
         if (unblock_port(port)) {
             json_object *result_obj = json_object_new_object();
+            json_object_object_add(result_obj, "entry", json_object_new_string(entry));
+            json_object_object_add(result_obj, "ip", json_object_new_string(ip_addr));
             json_object_object_add(result_obj, "port", json_object_new_int(port));
             json_object_object_add(result_obj, "status", json_object_new_string("unblocked"));
+            json_object_object_add(result_obj, "ip_added", json_object_new_boolean(!ip_existed));
             json_object_array_add(response_array, result_obj);
             success_count++;
+        } else {
+            json_object *result_obj = json_object_new_object();
+            json_object_object_add(result_obj, "entry", json_object_new_string(entry));
+            json_object_object_add(result_obj, "ip", json_object_new_string(ip_addr));
+            json_object_object_add(result_obj, "port", json_object_new_int(port));
+            json_object_object_add(result_obj, "status", json_object_new_string("error"));
+            json_object_object_add(result_obj, "message", json_object_new_string("Failed to unblock port"));
+            json_object_array_add(response_array, result_obj);
         }
     }
     
     // Generate response
     const char *response_str = json_object_to_json_string(response_array);
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
-                  "{\"status\":\"success\", \"message\":\"Unblocked %d of %d ports\", \"results\":%s}", 
-                  success_count, total_ports, response_str);
+                  "{\"status\":\"success\", \"message\":\"Unblocked %d of %d ports, added %d IPs\", \"results\":%s}", 
+                  success_count, total_ports, ip_added_count, response_str);
     
     json_object_put(response_array);
     json_object_put(root);
