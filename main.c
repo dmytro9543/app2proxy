@@ -36,7 +36,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.3.11"
+#define VERSION_STRING "1.4.1"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -5466,6 +5466,7 @@ static int is_command_allowed(const char *cmd) {
     if (strncmp(cmd, "systemctl ", 10) == 0) return 1;
     if (strncmp(cmd, "pidof ", 6) == 0) return 1;
     if (strcmp(cmd, "reboot") == 0) return 1;
+    if (strcmp(cmd, "ufw enable") == 0) return 1;
     return 0;
 }
 
@@ -5512,16 +5513,28 @@ static void handle_run_command(struct mg_connection *c, struct mg_http_message *
 
     // Append stderr to stdout for complete output
     char *fullcmd = NULL;
-    size_t flen = strlen(cmd) + 6;
-    fullcmd = (char*) malloc(flen);
-    if (!fullcmd) {
-        json_object_put(root);
-        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
-                      "{\"error\":\"Memory allocation failed\"}");
-        return;
+    if (strcmp(cmd, "ufw enable") == 0) {
+        size_t flen = strlen(cmd) + 17;
+        fullcmd = (char*) malloc(flen);
+        if (!fullcmd) {
+            json_object_put(root);
+            mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                          "{\"error\":\"Memory allocation failed\"}");
+            return;
+        }
+        snprintf(fullcmd, flen, "echo 'y' | %s 2>&1", cmd);
+    } else {
+        size_t flen = strlen(cmd) + 6;
+        fullcmd = (char*) malloc(flen);
+        if (!fullcmd) {
+            json_object_put(root);
+            mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                          "{\"error\":\"Memory allocation failed\"}");
+            return;
+        }
+        snprintf(fullcmd, flen, "%s 2>&1", cmd);
     }
-    snprintf(fullcmd, flen, "%s 2>&1", cmd);
-
+    
     int exit_code = -1;
     char *output = run_command_capture(fullcmd, &exit_code);
     free(fullcmd);
@@ -7281,26 +7294,34 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
       }
       else if( mg_match(hm->uri, mg_str("/resource-status"), NULL) ) {
-        char disk_str[32], cpu_str[32], memory_str[32];
-    
-        snprintf(disk_str, sizeof(disk_str), "%.2f%%", disk_usage);
-        snprintf(cpu_str, sizeof(cpu_str), "%.2f%%", cpu_usage);
-        snprintf(memory_str, sizeof(memory_str), "%.2f%%", mem_used);
-
-        // Create a JSON object
-        struct json_object *root = json_object_new_object();
-        
-        // Add the values
-        json_object_object_add(root, "disk", json_object_new_string(disk_str));
-        json_object_object_add(root, "cpu", json_object_new_string(cpu_str));
-        json_object_object_add(root, "memory", json_object_new_string(memory_str));
-        
-        // Convert to JSON string
-        const char *json_str = json_object_to_json_string(root);
-        printf("%s\n", json_str);
-        mg_http_reply(c, 200, "", "%s\n", json_str);
-        // Clean up
-        json_object_put(root);
+          char disk_str[32], cpu_str[32], memory_str[32];
+          char datetime_str[64];
+          
+          // Get current date and time
+          time_t now = time(NULL);
+          struct tm *tm_info = localtime(&now);
+          strftime(datetime_str, sizeof(datetime_str), "%Y-%m-%d %H:%M:%S", tm_info);
+  
+          snprintf(disk_str, sizeof(disk_str), "%.2f%%", disk_usage);
+          snprintf(cpu_str, sizeof(cpu_str), "%.2f%%", cpu_usage);
+          snprintf(memory_str, sizeof(memory_str), "%.2f%%", mem_used);
+  
+          // Create a JSON object
+          struct json_object *root = json_object_new_object();
+          
+          // Add the values
+          json_object_object_add(root, "disk", json_object_new_string(disk_str));
+          json_object_object_add(root, "cpu", json_object_new_string(cpu_str));
+          json_object_object_add(root, "memory", json_object_new_string(memory_str));
+          json_object_object_add(root, "datetime", json_object_new_string(datetime_str));
+          json_object_object_add(root, "timestamp", json_object_new_int64(now));
+          
+          // Convert to JSON string
+          const char *json_str = json_object_to_json_string(root);
+          printf("%s\n", json_str);
+          mg_http_reply(c, 200, "", "%s\n", json_str);
+          // Clean up
+          json_object_put(root);
       }
       else if( mg_match(hm->uri, mg_str("/service-status"), NULL) ) {
         ServiceStatus services[] = {
