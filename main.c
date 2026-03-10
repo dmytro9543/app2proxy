@@ -36,7 +36,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.4.1"
+#define VERSION_STRING "1.5.3"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -3400,7 +3400,7 @@ static char* update_users_line(const char *current_config, const char *username,
     return new_config;
 }
 
-// Delete proxy block by username - safe version (no VLAs, no O(nÃƒâ€šÃ‚Â²), atomic write)
+// Delete proxy block by username - safe version (no VLAs, atomic write)
 static int delete_proxy_by_username_simple(const char *username) {
     printf("Deleting proxy for user: %s\n", username);
     
@@ -3418,7 +3418,7 @@ static int delete_proxy_by_username_simple(const char *username) {
         return -1;
     }
     
-    size_t out_pos = 0;  // efficient output position tracking (no O(nÃƒâ€šÃ‚Â²))
+    size_t out_pos = 0;  // efficient output position tracking (no O(nÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²))
     new_config[0] = '\0';
     
     char *current = config;
@@ -3890,27 +3890,95 @@ static void printMg(struct mg_str *mgstr) {
   printf("\n--------------\n");
 }
 
-static int block_port(int port) {
-    char command[4096];
-    snprintf(command, sizeof(command), "ufw deny %d/tcp 2>/dev/null", port);
+static pthread_mutex_t firewall_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int firewall_initialized = 0;
+
+static int run_firewall_command(const char *command) {
     int result = system(command);
     return (result == 0);
 }
 
-// Function to unblock a port using ufw
+static int restore_firewall_state(void) {
+    run_firewall_command("mkdir -p /etc/app2proxy");
+    run_firewall_command("[ -f /etc/ipset.conf ] && ipset restore < /etc/ipset.conf >/dev/null 2>&1 || true");
+    return 1;
+}
+
+static int save_firewall_state(void) {
+    run_firewall_command("mkdir -p /etc/app2proxy");
+    return run_firewall_command("ipset save > /etc/ipset.conf");
+}
+
+static int ensure_firewall_objects_once(void) {
+    pthread_mutex_lock(&firewall_mutex);
+
+    if (firewall_initialized) {
+        pthread_mutex_unlock(&firewall_mutex);
+        return 1;
+    }
+
+    restore_firewall_state();
+
+    if (!run_firewall_command("ipset create -exist blocked_ports bitmap:port range 1-65535")) {
+        pthread_mutex_unlock(&firewall_mutex);
+        return 0;
+    }
+
+    if (!run_firewall_command("iptables -C INPUT -m set --match-set blocked_ports dst -j DROP 2>/dev/null || iptables -A INPUT -m set --match-set blocked_ports dst -j DROP")) {
+        pthread_mutex_unlock(&firewall_mutex);
+        return 0;
+    }
+
+    firewall_initialized = 1;
+    pthread_mutex_unlock(&firewall_mutex);
+    return 1;
+}
+
+static int block_port(int port) {
+    char command[4096];
+
+    if (!ensure_firewall_objects_once()) {
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "ipset add -exist blocked_ports %d", port);
+
+    pthread_mutex_lock(&firewall_mutex);
+    int ok = run_firewall_command(command);
+    if (ok) ok = save_firewall_state();
+    pthread_mutex_unlock(&firewall_mutex);
+
+    return ok;
+}
+
+// Function to unblock a port using ipset
 static int unblock_port(int port) {
     char command[4096];
-    snprintf(command, sizeof(command), "ufw allow %d/tcp 2>/dev/null", port);
-    int result = system(command);
-    return (result == 0);
+
+    if (!ensure_firewall_objects_once()) {
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "ipset del blocked_ports %d >/dev/null 2>&1 || true", port);
+
+    pthread_mutex_lock(&firewall_mutex);
+    int ok = run_firewall_command(command);
+    if (ok) ok = save_firewall_state();
+    pthread_mutex_unlock(&firewall_mutex);
+
+    return ok;
 }
 
 // Function to check if a port is blocked
 static int is_port_blocked(int port) {
     char command[4096];
-    snprintf(command, sizeof(command), "ufw status | grep -E '^%d/tcp.*DENY' > /dev/null", port);
-    int result = system(command);
-    return (result == 0);
+
+    if (!ensure_firewall_objects_once()) {
+        return 0;
+    }
+
+    snprintf(command, sizeof(command), "ipset test blocked_ports %d >/dev/null 2>&1", port);
+    return run_firewall_command(command);
 }
 
 // HTTP handler for block endpoint
@@ -5465,8 +5533,13 @@ static int is_command_allowed(const char *cmd) {
     if (strncmp(cmd, "service ", 8) == 0) return 1;
     if (strncmp(cmd, "systemctl ", 10) == 0) return 1;
     if (strncmp(cmd, "pidof ", 6) == 0) return 1;
+    if (strncmp(cmd, "iptables", 8) == 0) return 1;
+    if (strncmp(cmd, "ipset", 5) == 0) return 1;
+    if (strncmp(cmd, "apt", 3) == 0) return 1;
+    if (strncmp(cmd, "install", 7) == 0) return 1;
     if (strcmp(cmd, "reboot") == 0) return 1;
     if (strcmp(cmd, "ufw enable") == 0) return 1;
+    if (strncmp(cmd, "ufw", 3) == 0) return 1;
     return 0;
 }
 
@@ -6160,7 +6233,7 @@ static void handle_change_protocol(struct mg_connection *c, struct mg_http_messa
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) {
@@ -6557,7 +6630,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -6975,7 +7048,7 @@ static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -7611,6 +7684,10 @@ int main(int argc, char* argv[])
       // Non-fatal - continue without automatic cleanup
   }
   
+  if (!ensure_firewall_objects_once()) {
+      fprintf(stderr, "Failed to initialize ipset/iptables firewall objects");
+  }
+
   struct mg_mgr mgr;  // Declare event manager
   mg_mgr_init(&mgr);  // Initialise event manager
   mg_http_listen(&mgr, "http://0.0.0.0:8001", api_ev_handler, NULL);  // Setup listener
