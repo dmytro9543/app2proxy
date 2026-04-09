@@ -36,7 +36,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.5.3"
+#define VERSION_STRING "1.5.4"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -3688,17 +3688,17 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         
         if (strcmp(proxy_type, "parent") == 0) {
             // Format: "host:port:username:password parent_ip parent_port parent_user parent_pass"
-            if (sscanf(proxy_str, "%63[^:]:%d:%63[^:]:%63s %63s %63s", 
-                      host, &port, username, password, external_ip, parent_info) >= 5) {
+            char parent_ip[128], parent_user[128], parent_pass[128];
+            int parent_port;
+            if (sscanf(proxy_str, "%63[^:]:%d:%63[^:]:%63s %127s %d %127s %127s",
+                      host, &port, username, password,
+                      parent_ip, &parent_port, parent_user, parent_pass) == 8) {
                 parse_success = 1;
-                printf("Parsed: host=%s, port=%d, user=%s, pass=***, ip=%s, parent_info=%s\n", 
-                   host, port, username, external_ip, parent_info);
-                // Reconstruct parent info
-                char *space_pos = strchr(proxy_str, ' ');
-                if (space_pos) {
-                    strncpy(parent_info, space_pos + 1, sizeof(parent_info) - 1);
-                    parent_info[sizeof(parent_info) - 1] = '\0';
-                }
+                external_ip[0] = '\0';  // parent proxy does not use local bind IP
+                snprintf(parent_info, sizeof(parent_info), "%s %d %s %s",
+                         parent_ip, parent_port, parent_user, parent_pass);
+                printf("Parsed: host=%s, port=%d, user=%s, pass=***, parent_ip=%s, parent_port=%d\n",
+                       host, port, username, parent_ip, parent_port);
             }
         } else {
             // Format: "host:port:username:password external_ip"
@@ -3746,7 +3746,7 @@ static void handle_regenerate_proxy(struct mg_connection *c, struct mg_http_mess
         }
         
         // Ensure external IP is present on the interface
-        if (external_ip[0] != '\0') {
+        if (strcmp(proxy_type, "parent") != 0 && external_ip[0] != '\0') {
             int is_ipv6_addr = strchr(external_ip, ':') != NULL;
             const char *ip_version = is_ipv6_addr ? "IPv6" : "IPv4";
             printf("Adding %s address to interface...\n", ip_version);
@@ -5450,6 +5450,14 @@ static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_messa
         return;
     }
 
+    if (!old_ip) {
+        free(updated_config);
+        json_object_put(root);
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Parent proxy does not use local bind IP\"}");
+        return;
+    }
+    
     char interface_error[1024] = {0};
     int interface_success = add_ip_to_interface_with_cleanup(old_ip, new_ip, interface, 
                                                             interface_error, sizeof(interface_error));
