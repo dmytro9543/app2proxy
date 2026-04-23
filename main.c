@@ -74,7 +74,7 @@ typedef void (*sighandler_t) (int);
 
 #define MANAGED_IP_STATE_DIR "/var/lib/app2proxy"
 #define MANAGED_IP_STATE_FILE "/var/lib/app2proxy/managed_interface_ips.state"
-#define MANAGED_IP_RESTORE_INTERVAL 3
+#define MANAGED_IP_RESTORE_INTERVAL 30
 
 // Add these function declarations (after existing ones)
 static void ensure_log_directories(void);
@@ -111,6 +111,7 @@ typedef struct {
     char interface[IFNAMSIZ];
     char address[128];
     int is_ipv6;
+    int prefix_len;
 } ManagedIpEntry;
 
 static pthread_mutex_t managed_ip_state_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -118,11 +119,11 @@ static pthread_mutex_t managed_ip_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void ensure_managed_ip_state_dir(void);
 static int load_managed_ip_state(ManagedIpEntry **entries, size_t *count);
 static int save_managed_ip_state(const ManagedIpEntry *entries, size_t count);
-static int track_managed_ip(const char *ip_address, const char *interface, int is_ipv6);
+static int track_managed_ip(const char *ip_address, const char *interface, int is_ipv6, int prefix_len);
 static int untrack_managed_ip(const char *ip_address, const char *interface);
 static int is_ip_on_interface(const char *ip_address, const char *interface, int is_ipv6);
-static int managed_ip_state_file_exists(void);
-static void bootstrap_managed_ip_state_if_missing(void);
+static int normalize_ip_and_prefix(const char *ip_address, int is_ipv6, char *normalized_ip, size_t normalized_size, int *prefix_len);
+static int get_ip_prefix_on_interface(const char *ip_address, const char *interface, int is_ipv6, int *prefix_len);
 static void restore_managed_ips_once(void);
 static void *managed_ip_reconcile_thread(void *arg);
 
@@ -1985,232 +1986,70 @@ static void ensure_managed_ip_state_dir(void) {
     }
 }
 
-static int managed_ip_state_file_exists(void) {
-    struct stat st = {0};
-    return stat(MANAGED_IP_STATE_FILE, &st) == 0 && S_ISREG(st.st_mode);
-}
-
-static int append_bootstrap_managed_ip_entry(ManagedIpEntry **entries,
-                                             size_t *count,
-                                             const char *ip_address,
-                                             const char *interface,
-                                             int is_ipv6) {
-    if (!entries || !count || !ip_address || !*ip_address || !interface || !*interface) {
+static int normalize_ip_and_prefix(const char *ip_address, int is_ipv6, char *normalized_ip, size_t normalized_size, int *prefix_len) {
+    if (!ip_address || !*ip_address || !normalized_ip || normalized_size == 0) {
         return 0;
     }
 
-    for (size_t i = 0; i < *count; i++) {
-        if ((*entries)[i].is_ipv6 == (is_ipv6 ? 1 : 0) &&
-            strcmp((*entries)[i].address, ip_address) == 0 &&
-            strcmp((*entries)[i].interface, interface) == 0) {
-            return 1;
-        }
+    strncpy(normalized_ip, ip_address, normalized_size - 1);
+    normalized_ip[normalized_size - 1] = '\0';
+
+    int local_prefix = is_ipv6 ? 128 : 32;
+    char *slash = strchr(normalized_ip, '/');
+    if (slash) {
+        local_prefix = atoi(slash + 1);
+        *slash = '\0';
     }
 
-    ManagedIpEntry *tmp = realloc(*entries, (*count + 1) * sizeof(**entries));
-    if (!tmp) {
+    if (prefix_len) {
+        *prefix_len = local_prefix;
+    }
+
+    return normalized_ip[0] != '\0';
+}
+
+static int get_ip_prefix_on_interface(const char *ip_address, const char *interface, int is_ipv6, int *prefix_len) {
+    if (!ip_address || !*ip_address || !interface || !*interface || !prefix_len) {
         return 0;
     }
 
-    *entries = tmp;
-    memset(&(*entries)[*count], 0, sizeof((*entries)[*count]));
-    strncpy((*entries)[*count].address, ip_address, sizeof((*entries)[*count].address) - 1);
-    strncpy((*entries)[*count].interface, interface, sizeof((*entries)[*count].interface) - 1);
-    (*entries)[*count].is_ipv6 = is_ipv6 ? 1 : 0;
-    (*count)++;
-    return 1;
-}
-
-static void trim_interface_alias(char *interface) {
-    if (!interface) return;
-    char *at = strchr(interface, '@');
-    if (at) *at = '\0';
-}
-
-static int get_default_route_interface(int is_ipv6, char *interface, size_t interface_size) {
-    if (!interface || interface_size == 0) {
+    char base_ip[128] = {0};
+    int requested_prefix = is_ipv6 ? 128 : 32;
+    if (!normalize_ip_and_prefix(ip_address, is_ipv6, base_ip, sizeof(base_ip), &requested_prefix)) {
         return 0;
     }
 
-    const char *command = is_ipv6 ?
-        "ip -o -6 route show default | awk '{for(i=1;i<=NF;i++) if ($i==\"dev\" && i+1<=NF) {print $(i+1); exit}}'" :
-        "ip -o -4 route show default | awk '{for(i=1;i<=NF;i++) if ($i==\"dev\" && i+1<=NF) {print $(i+1); exit}}'";
+    char command[512];
+    if (is_ipv6) {
+        snprintf(command, sizeof(command),
+                 "ip -o -6 addr show dev %s scope global | awk '$4 ~ /^%s\// {print $4; exit}'",
+                 interface, base_ip);
+    } else {
+        snprintf(command, sizeof(command),
+                 "ip -o -4 addr show dev %s scope global | awk '$4 ~ /^%s\// {print $4; exit}'",
+                 interface, base_ip);
+    }
 
     FILE *fp = popen(command, "r");
     if (!fp) {
         return 0;
     }
 
-    if (!fgets(interface, interface_size, fp)) {
+    char cidr[128] = {0};
+    if (!fgets(cidr, sizeof(cidr), fp)) {
         pclose(fp);
         return 0;
     }
-
     pclose(fp);
-    interface[strcspn(interface, "\n")] = '\0';
-    trim_interface_alias(interface);
-    return interface[0] != '\0';
-}
 
-static int find_interface_for_ip(const char *ip_address, int is_ipv6, char *interface, size_t interface_size) {
-    if (!ip_address || !*ip_address || !interface || interface_size == 0) {
+    cidr[strcspn(cidr, "\n")] = '\0';
+    char *slash = strchr(cidr, '/');
+    if (!slash || !*(slash + 1)) {
         return 0;
     }
 
-    char base_ip[128] = {0};
-    strncpy(base_ip, ip_address, sizeof(base_ip) - 1);
-    char *slash = strchr(base_ip, '/');
-    if (slash) *slash = '\0';
-
-    char command[512];
-    if (is_ipv6) {
-        snprintf(command, sizeof(command),
-                 "ip -o -6 addr show scope global | awk '$4 ~ /^%s\\// {print $2; exit}'",
-                 base_ip);
-    } else {
-        snprintf(command, sizeof(command),
-                 "ip -o -4 addr show scope global | awk '$4 ~ /^%s\\// {print $2; exit}'",
-                 base_ip);
-    }
-
-    FILE *fp = popen(command, "r");
-    if (fp) {
-        if (fgets(interface, interface_size, fp)) {
-            pclose(fp);
-            interface[strcspn(interface, "\n")] = '\0';
-            trim_interface_alias(interface);
-            if (interface[0] != '\0') {
-                return 1;
-            }
-        } else {
-            pclose(fp);
-        }
-    }
-
-    return get_default_route_interface(is_ipv6, interface, interface_size);
-}
-
-static void bootstrap_managed_ip_state_from_live_scan(ManagedIpEntry **entries, size_t *count) {
-    FILE *fp = popen("ip -o -6 addr show scope global", "r");
-    if (fp) {
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
-            char interface[IFNAMSIZ] = {0};
-            char cidr[128] = {0};
-            if (sscanf(line, "%*d: %15s inet6 %127s", interface, cidr) == 2) {
-                trim_interface_alias(interface);
-                if (strcmp(interface, "lo") == 0) {
-                    continue;
-                }
-
-                char *slash = strchr(cidr, '/');
-                if (!slash) {
-                    continue;
-                }
-
-                int prefix = atoi(slash + 1);
-                if (prefix != 128) {
-                    continue;
-                }
-                *slash = '\0';
-
-                append_bootstrap_managed_ip_entry(entries, count, cidr, interface, 1);
-            }
-        }
-        pclose(fp);
-    }
-
-    fp = popen("ip -o -4 addr show scope global", "r");
-    if (fp) {
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
-            char interface[IFNAMSIZ] = {0};
-            char cidr[128] = {0};
-            if (sscanf(line, "%*d: %15s inet %127s", interface, cidr) == 2) {
-                trim_interface_alias(interface);
-                if (strcmp(interface, "lo") == 0) {
-                    continue;
-                }
-
-                char *slash = strchr(cidr, '/');
-                int prefix = slash ? atoi(slash + 1) : -1;
-                if (strstr(line, " secondary ") == NULL && prefix != 32) {
-                    continue;
-                }
-                if (slash) {
-                    *slash = '\0';
-                }
-
-                append_bootstrap_managed_ip_entry(entries, count, cidr, interface, 0);
-            }
-        }
-        pclose(fp);
-    }
-}
-
-static void bootstrap_managed_ip_state_from_3proxy_config(ManagedIpEntry **entries, size_t *count) {
-    char *config = read_3proxy_config();
-    if (!config) {
-        return;
-    }
-
-    char *config_copy = strdup(config);
-    free(config);
-    if (!config_copy) {
-        return;
-    }
-
-    char *saveptr = NULL;
-    for (char *line = strtok_r(config_copy, "\n", &saveptr);
-         line != NULL;
-         line = strtok_r(NULL, "\n", &saveptr)) {
-        if (strstr(line, " parent ") != NULL) {
-            continue;
-        }
-        if (strstr(line, "proxy") == NULL && strstr(line, "socks") == NULL) {
-            continue;
-        }
-
-        int is_ipv6 = 0;
-        char *external_ip = extract_external_ip_address(line, &is_ipv6);
-        if (!external_ip || !*external_ip) {
-            free(external_ip);
-            continue;
-        }
-
-        char interface[IFNAMSIZ] = {0};
-        if (find_interface_for_ip(external_ip, is_ipv6, interface, sizeof(interface))) {
-            append_bootstrap_managed_ip_entry(entries, count, external_ip, interface, is_ipv6);
-        }
-
-        free(external_ip);
-    }
-
-    free(config_copy);
-}
-
-static void bootstrap_managed_ip_state_if_missing(void) {
-    if (managed_ip_state_file_exists()) {
-        return;
-    }
-
-    printf("Managed IP bootstrap: state file missing, scanning live IPs and 3proxy config\n");
-
-    ManagedIpEntry *entries = NULL;
-    size_t count = 0;
-
-    bootstrap_managed_ip_state_from_live_scan(&entries, &count);
-    bootstrap_managed_ip_state_from_3proxy_config(&entries, &count);
-
-    pthread_mutex_lock(&managed_ip_state_mutex);
-    if (!save_managed_ip_state(entries, count)) {
-        printf("Managed IP bootstrap: failed to save %zu discovered entries\n", count);
-    } else {
-        printf("Managed IP bootstrap: saved %zu discovered entries\n", count);
-    }
-    pthread_mutex_unlock(&managed_ip_state_mutex);
-
-    free(entries);
+    *prefix_len = atoi(slash + 1);
+    return 1;
 }
 
 static int load_managed_ip_state(ManagedIpEntry **entries, size_t *count) {
@@ -2237,9 +2076,14 @@ static int load_managed_ip_state(ManagedIpEntry **entries, size_t *count) {
         char interface_buf[IFNAMSIZ] = {0};
         char address_buf[128] = {0};
         int is_ipv6 = 0;
+        int prefix_len = 0;
 
-        if (sscanf(line, "%15s %d %127s", interface_buf, &is_ipv6, address_buf) != 3) {
+        int parsed = sscanf(line, "%15s %d %127s %d", interface_buf, &is_ipv6, address_buf, &prefix_len);
+        if (parsed < 3) {
             continue;
+        }
+        if (parsed < 4 || prefix_len <= 0) {
+            prefix_len = is_ipv6 ? 128 : 32;
         }
 
         ManagedIpEntry *tmp = realloc(list, (used + 1) * sizeof(*tmp));
@@ -2255,6 +2099,7 @@ static int load_managed_ip_state(ManagedIpEntry **entries, size_t *count) {
         strncpy(list[used].interface, interface_buf, sizeof(list[used].interface) - 1);
         strncpy(list[used].address, address_buf, sizeof(list[used].address) - 1);
         list[used].is_ipv6 = is_ipv6 ? 1 : 0;
+        list[used].prefix_len = prefix_len;
         used++;
     }
 
@@ -2301,9 +2146,13 @@ static int save_managed_ip_state(const ManagedIpEntry *entries, size_t count) {
     return 1;
 }
 
-static int track_managed_ip(const char *ip_address, const char *interface, int is_ipv6) {
+static int track_managed_ip(const char *ip_address, const char *interface, int is_ipv6, int prefix_len) {
     if (!ip_address || !*ip_address || !interface || !*interface) {
         return 0;
+    }
+
+    if (prefix_len <= 0) {
+        prefix_len = is_ipv6 ? 128 : 32;
     }
 
     pthread_mutex_lock(&managed_ip_state_mutex);
@@ -2320,7 +2169,12 @@ static int track_managed_ip(const char *ip_address, const char *interface, int i
         if (entries[i].is_ipv6 == (is_ipv6 ? 1 : 0) &&
             strcmp(entries[i].address, ip_address) == 0 &&
             strcmp(entries[i].interface, interface) == 0) {
-            ok = 1;
+            if (entries[i].prefix_len != prefix_len) {
+                entries[i].prefix_len = prefix_len;
+                ok = save_managed_ip_state(entries, count);
+            } else {
+                ok = 1;
+            }
             goto done;
         }
     }
@@ -2335,6 +2189,7 @@ static int track_managed_ip(const char *ip_address, const char *interface, int i
     strncpy(entries[count].address, ip_address, sizeof(entries[count].address) - 1);
     strncpy(entries[count].interface, interface, sizeof(entries[count].interface) - 1);
     entries[count].is_ipv6 = is_ipv6 ? 1 : 0;
+    entries[count].prefix_len = prefix_len;
     count++;
 
     ok = save_managed_ip_state(entries, count);
@@ -2350,6 +2205,14 @@ static int untrack_managed_ip(const char *ip_address, const char *interface) {
         return 0;
     }
 
+    char normalized_ip[128] = {0};
+    strncpy(normalized_ip, ip_address, sizeof(normalized_ip) - 1);
+    normalized_ip[sizeof(normalized_ip) - 1] = '\0';
+    char *slash = strchr(normalized_ip, '/');
+    if (slash) {
+        *slash = '\0';
+    }
+
     pthread_mutex_lock(&managed_ip_state_mutex);
 
     ManagedIpEntry *entries = NULL;
@@ -2363,7 +2226,7 @@ static int untrack_managed_ip(const char *ip_address, const char *interface) {
     }
 
     for (size_t i = 0; i < count; i++) {
-        int match_ip = strcmp(entries[i].address, ip_address) == 0;
+        int match_ip = strcmp(entries[i].address, normalized_ip) == 0;
         int match_if = (!interface || !*interface || strcmp(entries[i].interface, interface) == 0);
 
         if (match_ip && match_if) {
@@ -3932,7 +3795,7 @@ static int delete_proxy_by_username_simple(const char *username) {
         return -1;
     }
     
-    size_t out_pos = 0;  // efficient output position tracking (no O(nÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²))
+    size_t out_pos = 0;  // efficient output position tracking (no O(nÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²))
     new_config[0] = '\0';
     
     char *current = config;
@@ -5127,11 +4990,22 @@ static int remove_ip_from_interface(const char *ip_address, const char *interfac
 // Function to add IP address to interface
 static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size) {
     char command[4096];
-    
+    char normalized_ip[128] = {0};
+    int prefix_len = is_ipv6 ? 128 : 32;
+
+    if (!normalize_ip_and_prefix(ip_address, is_ipv6, normalized_ip, sizeof(normalized_ip), &prefix_len)) {
+        snprintf(error_str, error_size, "Invalid IP address");
+        return 0;
+    }
+
     if (is_ipv6) {
-        snprintf(command, sizeof(command), "ip -6 addr add %s/128 dev %s 2>&1", ip_address, interface);
+        snprintf(command, sizeof(command), "ip -6 addr add %s/%d dev %s 2>&1", normalized_ip, prefix_len, interface);
     } else {
-        snprintf(command, sizeof(command), "ip addr add %s dev %s 2>&1", ip_address, interface);
+        if (strchr(ip_address, '/') != NULL) {
+            snprintf(command, sizeof(command), "ip addr add %s dev %s 2>&1", ip_address, interface);
+        } else {
+            snprintf(command, sizeof(command), "ip addr add %s dev %s 2>&1", normalized_ip, interface);
+        }
     }
     
     FILE *fp = popen(command, "r");
@@ -5163,7 +5037,11 @@ static int add_ip_to_interface(const char *ip_address, const char *interface, in
     printf("Output: %s\n", output);
     
     if (result == 0 || already_exists) {
-        track_managed_ip(ip_address, interface, is_ipv6);
+        int actual_prefix_len = prefix_len;
+        if (get_ip_prefix_on_interface(normalized_ip, interface, is_ipv6, &actual_prefix_len)) {
+            prefix_len = actual_prefix_len;
+        }
+        track_managed_ip(normalized_ip, interface, is_ipv6, prefix_len);
         return 1;
     }
 
@@ -6858,7 +6736,7 @@ static void handle_change_protocol(struct mg_connection *c, struct mg_http_messa
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) {
@@ -7255,7 +7133,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -7673,7 +7551,7 @@ static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -8314,7 +8192,6 @@ int main(int argc, char* argv[])
   }
 
   ensure_managed_ip_state_dir();
-  bootstrap_managed_ip_state_if_missing();
   restore_managed_ips_once();
 
   pthread_t managed_ip_thread;
