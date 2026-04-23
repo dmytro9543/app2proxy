@@ -36,7 +36,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.5.4"
+#define VERSION_STRING "1.5.5"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -4234,6 +4234,83 @@ static int is_ip_on_system(const char *ip_address) {
     return (result == 0) ? 1 : 0;
 }
 
+static int is_parent_proxy_port(const char *config_content, int target_port) {
+    if (!config_content || target_port <= 0) {
+        return 0;
+    }
+
+    const char *cursor = config_content;
+    int previous_line_was_parent = 0;
+
+    while (*cursor) {
+        const char *line_end = strchr(cursor, '\n');
+        size_t raw_len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+
+        const char *trimmed = cursor;
+        size_t line_len = raw_len;
+        while (line_len > 0 && (*trimmed == ' ' || *trimmed == '\t')) {
+            trimmed++;
+            line_len--;
+        }
+
+        if (line_len == 0) {
+            previous_line_was_parent = 0;
+            cursor = line_end ? line_end + 1 : cursor + raw_len;
+            continue;
+        }
+
+        char *line = malloc(line_len + 1);
+        if (!line) {
+            return 0;
+        }
+        memcpy(line, trimmed, line_len);
+        line[line_len] = '\0';
+
+        if (strncmp(line, "parent", 6) == 0) {
+            previous_line_was_parent = 1;
+        } else if (strncmp(line, "proxy", 5) == 0 || strncmp(line, "socks", 5) == 0) {
+            int found_port = -1;
+            char *saveptr = NULL;
+            char *token = strtok_r(line, " \t", &saveptr);
+
+            while (token) {
+                if (strcmp(token, "-p") == 0) {
+                    char *port_token = strtok_r(NULL, " \t", &saveptr);
+                    if (port_token) {
+                        char *endptr;
+                        long port_val = strtol(port_token, &endptr, 10);
+                        if (endptr != port_token && *endptr == '\0') {
+                            found_port = (int) port_val;
+                        }
+                    }
+                } else if (strncmp(token, "-p", 2) == 0 && token[2] != '\0') {
+                    char *endptr;
+                    long port_val = strtol(token + 2, &endptr, 10);
+                    if (endptr != token + 2 && *endptr == '\0') {
+                        found_port = (int) port_val;
+                    }
+                }
+                token = strtok_r(NULL, " \t", &saveptr);
+            }
+
+            free(line);
+            if (found_port == target_port) {
+                return previous_line_was_parent;
+            }
+            previous_line_was_parent = 0;
+            cursor = line_end ? line_end + 1 : cursor + raw_len;
+            continue;
+        } else {
+            previous_line_was_parent = 0;
+        }
+
+        free(line);
+        cursor = line_end ? line_end + 1 : cursor + raw_len;
+    }
+
+    return 0;
+}
+
 static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message *hm) {
     // Parse JSON body
     char *body_str = malloc(hm->body.len + 1);
@@ -4272,7 +4349,15 @@ static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message
         json_object_is_type(interface_obj, json_type_string)) {
         interface = json_object_get_string(interface_obj);
     }
-    
+
+    char *config_content = read_3proxy_config();
+    if (!config_content) {
+        json_object_put(root);
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                      "{\"error\":\"Unable to read 3proxy configuration\"}");
+        return;
+    }
+
     // Create response array
     json_object *response_array = json_object_new_array();
     int success_count = 0;
@@ -4321,10 +4406,14 @@ static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message
             json_object_array_add(response_array, result_obj);
             continue;
         }
-        
-        // Check if IP exists on the system; if not, add it
+
         int ip_existed = 1;
-        if (!is_ip_on_system(ip_addr)) {
+        int is_parent_port = is_parent_proxy_port(config_content, port);
+
+        // Check if IP exists on the system; if not, add it for non-parent proxies only
+        if (is_parent_port) {
+            printf("Port %d is parent proxy, skipping IP add for %s\n", port, ip_addr);
+        } else if (!is_ip_on_system(ip_addr)) {
             ip_existed = 0;
             int is_ipv6 = (strchr(ip_addr, ':') != NULL);
             char error_msg[1024] = {0};
@@ -4374,7 +4463,8 @@ static void handle_unblock_ports(struct mg_connection *c, struct mg_http_message
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", 
                   "{\"status\":\"success\", \"message\":\"Unblocked %d of %d ports, added %d IPs\", \"results\":%s}", 
                   success_count, total_ports, ip_added_count, response_str);
-    
+
+    free(config_content);
     json_object_put(response_array);
     json_object_put(root);
 }
