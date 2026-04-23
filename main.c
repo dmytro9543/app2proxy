@@ -72,6 +72,10 @@ typedef void (*sighandler_t) (int);
 #define LOG_RETENTION_DAYS 7
 #define MAX_LOG_FILE_SIZE_KB (10 * 1024)  // 10MB max per log file before truncation
 
+#define MANAGED_IP_STATE_DIR "/var/lib/app2proxy"
+#define MANAGED_IP_STATE_FILE "/var/lib/app2proxy/managed_interface_ips.state"
+#define MANAGED_IP_RESTORE_INTERVAL 3
+
 // Add these function declarations (after existing ones)
 static void ensure_log_directories(void);
 static void log_api_with_config_backup(const char *method, const char *uri, 
@@ -100,6 +104,27 @@ static void handle_update_proxy_ip(struct mg_connection *c, struct mg_http_messa
 static int get_query_param(const struct mg_str *query, const char *key, char *value, size_t value_size);
 static int add_ip_to_interface(const char *ip_address, const char *interface, int is_ipv6, char *error_str, size_t error_size);
 static int is_ip_on_system(const char *ip_address);
+static char* extract_external_ip_address(const char* block, int *is_ipv6);
+static char* read_3proxy_config();
+
+typedef struct {
+    char interface[IFNAMSIZ];
+    char address[128];
+    int is_ipv6;
+} ManagedIpEntry;
+
+static pthread_mutex_t managed_ip_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void ensure_managed_ip_state_dir(void);
+static int load_managed_ip_state(ManagedIpEntry **entries, size_t *count);
+static int save_managed_ip_state(const ManagedIpEntry *entries, size_t count);
+static int track_managed_ip(const char *ip_address, const char *interface, int is_ipv6);
+static int untrack_managed_ip(const char *ip_address, const char *interface);
+static int is_ip_on_interface(const char *ip_address, const char *interface, int is_ipv6);
+static int managed_ip_state_file_exists(void);
+static void bootstrap_managed_ip_state_if_missing(void);
+static void restore_managed_ips_once(void);
+static void *managed_ip_reconcile_thread(void *arg);
 
 static void sig_usr_un(int signo)
 {
@@ -1950,6 +1975,490 @@ static void handle_ipv4_ping_test(struct mg_connection *c, struct mg_http_messag
     json_object_put(root);
 }
 
+static void ensure_managed_ip_state_dir(void) {
+    struct stat st = {0};
+    if (stat(MANAGED_IP_STATE_DIR, &st) == -1) {
+        if (mkdir(MANAGED_IP_STATE_DIR, 0755) != 0 && errno != EEXIST) {
+            printf("Failed to create managed IP state dir %s: %s\n",
+                   MANAGED_IP_STATE_DIR, strerror(errno));
+        }
+    }
+}
+
+static int managed_ip_state_file_exists(void) {
+    struct stat st = {0};
+    return stat(MANAGED_IP_STATE_FILE, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int append_bootstrap_managed_ip_entry(ManagedIpEntry **entries,
+                                             size_t *count,
+                                             const char *ip_address,
+                                             const char *interface,
+                                             int is_ipv6) {
+    if (!entries || !count || !ip_address || !*ip_address || !interface || !*interface) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < *count; i++) {
+        if ((*entries)[i].is_ipv6 == (is_ipv6 ? 1 : 0) &&
+            strcmp((*entries)[i].address, ip_address) == 0 &&
+            strcmp((*entries)[i].interface, interface) == 0) {
+            return 1;
+        }
+    }
+
+    ManagedIpEntry *tmp = realloc(*entries, (*count + 1) * sizeof(**entries));
+    if (!tmp) {
+        return 0;
+    }
+
+    *entries = tmp;
+    memset(&(*entries)[*count], 0, sizeof((*entries)[*count]));
+    strncpy((*entries)[*count].address, ip_address, sizeof((*entries)[*count].address) - 1);
+    strncpy((*entries)[*count].interface, interface, sizeof((*entries)[*count].interface) - 1);
+    (*entries)[*count].is_ipv6 = is_ipv6 ? 1 : 0;
+    (*count)++;
+    return 1;
+}
+
+static void trim_interface_alias(char *interface) {
+    if (!interface) return;
+    char *at = strchr(interface, '@');
+    if (at) *at = '\0';
+}
+
+static int get_default_route_interface(int is_ipv6, char *interface, size_t interface_size) {
+    if (!interface || interface_size == 0) {
+        return 0;
+    }
+
+    const char *command = is_ipv6 ?
+        "ip -o -6 route show default | awk '{for(i=1;i<=NF;i++) if ($i==\"dev\" && i+1<=NF) {print $(i+1); exit}}'" :
+        "ip -o -4 route show default | awk '{for(i=1;i<=NF;i++) if ($i==\"dev\" && i+1<=NF) {print $(i+1); exit}}'";
+
+    FILE *fp = popen(command, "r");
+    if (!fp) {
+        return 0;
+    }
+
+    if (!fgets(interface, interface_size, fp)) {
+        pclose(fp);
+        return 0;
+    }
+
+    pclose(fp);
+    interface[strcspn(interface, "\n")] = '\0';
+    trim_interface_alias(interface);
+    return interface[0] != '\0';
+}
+
+static int find_interface_for_ip(const char *ip_address, int is_ipv6, char *interface, size_t interface_size) {
+    if (!ip_address || !*ip_address || !interface || interface_size == 0) {
+        return 0;
+    }
+
+    char base_ip[128] = {0};
+    strncpy(base_ip, ip_address, sizeof(base_ip) - 1);
+    char *slash = strchr(base_ip, '/');
+    if (slash) *slash = '\0';
+
+    char command[512];
+    if (is_ipv6) {
+        snprintf(command, sizeof(command),
+                 "ip -o -6 addr show scope global | awk '$4 ~ /^%s\\// {print $2; exit}'",
+                 base_ip);
+    } else {
+        snprintf(command, sizeof(command),
+                 "ip -o -4 addr show scope global | awk '$4 ~ /^%s\\// {print $2; exit}'",
+                 base_ip);
+    }
+
+    FILE *fp = popen(command, "r");
+    if (fp) {
+        if (fgets(interface, interface_size, fp)) {
+            pclose(fp);
+            interface[strcspn(interface, "\n")] = '\0';
+            trim_interface_alias(interface);
+            if (interface[0] != '\0') {
+                return 1;
+            }
+        } else {
+            pclose(fp);
+        }
+    }
+
+    return get_default_route_interface(is_ipv6, interface, interface_size);
+}
+
+static void bootstrap_managed_ip_state_from_live_scan(ManagedIpEntry **entries, size_t *count) {
+    FILE *fp = popen("ip -o -6 addr show scope global", "r");
+    if (fp) {
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            char interface[IFNAMSIZ] = {0};
+            char cidr[128] = {0};
+            if (sscanf(line, "%*d: %15s inet6 %127s", interface, cidr) == 2) {
+                trim_interface_alias(interface);
+                if (strcmp(interface, "lo") == 0) {
+                    continue;
+                }
+
+                char *slash = strchr(cidr, '/');
+                if (!slash) {
+                    continue;
+                }
+
+                int prefix = atoi(slash + 1);
+                if (prefix != 128) {
+                    continue;
+                }
+                *slash = '\0';
+
+                append_bootstrap_managed_ip_entry(entries, count, cidr, interface, 1);
+            }
+        }
+        pclose(fp);
+    }
+
+    fp = popen("ip -o -4 addr show scope global", "r");
+    if (fp) {
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            char interface[IFNAMSIZ] = {0};
+            char cidr[128] = {0};
+            if (sscanf(line, "%*d: %15s inet %127s", interface, cidr) == 2) {
+                trim_interface_alias(interface);
+                if (strcmp(interface, "lo") == 0) {
+                    continue;
+                }
+
+                char *slash = strchr(cidr, '/');
+                int prefix = slash ? atoi(slash + 1) : -1;
+                if (strstr(line, " secondary ") == NULL && prefix != 32) {
+                    continue;
+                }
+                if (slash) {
+                    *slash = '\0';
+                }
+
+                append_bootstrap_managed_ip_entry(entries, count, cidr, interface, 0);
+            }
+        }
+        pclose(fp);
+    }
+}
+
+static void bootstrap_managed_ip_state_from_3proxy_config(ManagedIpEntry **entries, size_t *count) {
+    char *config = read_3proxy_config();
+    if (!config) {
+        return;
+    }
+
+    char *config_copy = strdup(config);
+    free(config);
+    if (!config_copy) {
+        return;
+    }
+
+    char *saveptr = NULL;
+    for (char *line = strtok_r(config_copy, "\n", &saveptr);
+         line != NULL;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        if (strstr(line, " parent ") != NULL) {
+            continue;
+        }
+        if (strstr(line, "proxy") == NULL && strstr(line, "socks") == NULL) {
+            continue;
+        }
+
+        int is_ipv6 = 0;
+        char *external_ip = extract_external_ip_address(line, &is_ipv6);
+        if (!external_ip || !*external_ip) {
+            free(external_ip);
+            continue;
+        }
+
+        char interface[IFNAMSIZ] = {0};
+        if (find_interface_for_ip(external_ip, is_ipv6, interface, sizeof(interface))) {
+            append_bootstrap_managed_ip_entry(entries, count, external_ip, interface, is_ipv6);
+        }
+
+        free(external_ip);
+    }
+
+    free(config_copy);
+}
+
+static void bootstrap_managed_ip_state_if_missing(void) {
+    if (managed_ip_state_file_exists()) {
+        return;
+    }
+
+    printf("Managed IP bootstrap: state file missing, scanning live IPs and 3proxy config\n");
+
+    ManagedIpEntry *entries = NULL;
+    size_t count = 0;
+
+    bootstrap_managed_ip_state_from_live_scan(&entries, &count);
+    bootstrap_managed_ip_state_from_3proxy_config(&entries, &count);
+
+    pthread_mutex_lock(&managed_ip_state_mutex);
+    if (!save_managed_ip_state(entries, count)) {
+        printf("Managed IP bootstrap: failed to save %zu discovered entries\n", count);
+    } else {
+        printf("Managed IP bootstrap: saved %zu discovered entries\n", count);
+    }
+    pthread_mutex_unlock(&managed_ip_state_mutex);
+
+    free(entries);
+}
+
+static int load_managed_ip_state(ManagedIpEntry **entries, size_t *count) {
+    *entries = NULL;
+    *count = 0;
+
+    ensure_managed_ip_state_dir();
+
+    FILE *fp = fopen(MANAGED_IP_STATE_FILE, "r");
+    if (!fp) {
+        if (errno == ENOENT) {
+            return 1;
+        }
+        printf("Failed to open managed IP state file %s: %s\n",
+               MANAGED_IP_STATE_FILE, strerror(errno));
+        return 0;
+    }
+
+    ManagedIpEntry *list = NULL;
+    size_t used = 0;
+    char line[512];
+
+    while (fgets(line, sizeof(line), fp)) {
+        char interface_buf[IFNAMSIZ] = {0};
+        char address_buf[128] = {0};
+        int is_ipv6 = 0;
+
+        if (sscanf(line, "%15s %d %127s", interface_buf, &is_ipv6, address_buf) != 3) {
+            continue;
+        }
+
+        ManagedIpEntry *tmp = realloc(list, (used + 1) * sizeof(*tmp));
+        if (!tmp) {
+            free(list);
+            fclose(fp);
+            printf("Failed to expand managed IP state list\n");
+            return 0;
+        }
+        list = tmp;
+
+        memset(&list[used], 0, sizeof(list[used]));
+        strncpy(list[used].interface, interface_buf, sizeof(list[used].interface) - 1);
+        strncpy(list[used].address, address_buf, sizeof(list[used].address) - 1);
+        list[used].is_ipv6 = is_ipv6 ? 1 : 0;
+        used++;
+    }
+
+    fclose(fp);
+    *entries = list;
+    *count = used;
+    return 1;
+}
+
+static int save_managed_ip_state(const ManagedIpEntry *entries, size_t count) {
+    ensure_managed_ip_state_dir();
+
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", MANAGED_IP_STATE_FILE);
+
+    FILE *fp = fopen(tmp_path, "w");
+    if (!fp) {
+        printf("Failed to open temp managed IP state file %s: %s\n",
+               tmp_path, strerror(errno));
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        fprintf(fp, "%s %d %s\n",
+                entries[i].interface,
+                entries[i].is_ipv6,
+                entries[i].address);
+    }
+
+    if (fclose(fp) != 0) {
+        printf("Failed to close temp managed IP state file %s: %s\n",
+               tmp_path, strerror(errno));
+        unlink(tmp_path);
+        return 0;
+    }
+
+    if (rename(tmp_path, MANAGED_IP_STATE_FILE) != 0) {
+        printf("Failed to replace managed IP state file %s: %s\n",
+               MANAGED_IP_STATE_FILE, strerror(errno));
+        unlink(tmp_path);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int track_managed_ip(const char *ip_address, const char *interface, int is_ipv6) {
+    if (!ip_address || !*ip_address || !interface || !*interface) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&managed_ip_state_mutex);
+
+    ManagedIpEntry *entries = NULL;
+    size_t count = 0;
+    int ok = 0;
+
+    if (!load_managed_ip_state(&entries, &count)) {
+        goto done;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].is_ipv6 == (is_ipv6 ? 1 : 0) &&
+            strcmp(entries[i].address, ip_address) == 0 &&
+            strcmp(entries[i].interface, interface) == 0) {
+            ok = 1;
+            goto done;
+        }
+    }
+
+    ManagedIpEntry *tmp = realloc(entries, (count + 1) * sizeof(*tmp));
+    if (!tmp) {
+        goto done;
+    }
+    entries = tmp;
+
+    memset(&entries[count], 0, sizeof(entries[count]));
+    strncpy(entries[count].address, ip_address, sizeof(entries[count].address) - 1);
+    strncpy(entries[count].interface, interface, sizeof(entries[count].interface) - 1);
+    entries[count].is_ipv6 = is_ipv6 ? 1 : 0;
+    count++;
+
+    ok = save_managed_ip_state(entries, count);
+
+done:
+    free(entries);
+    pthread_mutex_unlock(&managed_ip_state_mutex);
+    return ok;
+}
+
+static int untrack_managed_ip(const char *ip_address, const char *interface) {
+    if (!ip_address || !*ip_address) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&managed_ip_state_mutex);
+
+    ManagedIpEntry *entries = NULL;
+    size_t count = 0;
+    ManagedIpEntry *filtered = NULL;
+    size_t kept = 0;
+    int ok = 0;
+
+    if (!load_managed_ip_state(&entries, &count)) {
+        goto done;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        int match_ip = strcmp(entries[i].address, ip_address) == 0;
+        int match_if = (!interface || !*interface || strcmp(entries[i].interface, interface) == 0);
+
+        if (match_ip && match_if) {
+            continue;
+        }
+
+        ManagedIpEntry *tmp = realloc(filtered, (kept + 1) * sizeof(*tmp));
+        if (!tmp) {
+            goto done;
+        }
+        filtered = tmp;
+        filtered[kept++] = entries[i];
+    }
+
+    ok = save_managed_ip_state(filtered, kept);
+
+done:
+    free(filtered);
+    free(entries);
+    pthread_mutex_unlock(&managed_ip_state_mutex);
+    return ok;
+}
+
+static int is_ip_on_interface(const char *ip_address, const char *interface, int is_ipv6) {
+    if (!ip_address || !*ip_address || !interface || !*interface) {
+        return 0;
+    }
+
+    char base_ip[128] = {0};
+    strncpy(base_ip, ip_address, sizeof(base_ip) - 1);
+    char *slash = strchr(base_ip, '/');
+    if (slash) {
+        *slash = '\0';
+    }
+
+    char command[512];
+    if (is_ipv6) {
+        snprintf(command, sizeof(command),
+                 "ip -6 addr show dev %s | grep -q '%s/'",
+                 interface, base_ip);
+    } else {
+        snprintf(command, sizeof(command),
+                 "ip -4 addr show dev %s | grep -Eq 'inet %s(/| )'",
+                 interface, base_ip);
+    }
+
+    return system(command) == 0;
+}
+
+static void restore_managed_ips_once(void) {
+    ManagedIpEntry *entries = NULL;
+    size_t count = 0;
+
+    if (!load_managed_ip_state(&entries, &count)) {
+        printf("Failed to load managed IP state for restore\n");
+        return;
+    }
+
+    if (count > 0) {
+        printf("Managed IP restore: loaded %zu entries\n", count);
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        char error_msg[1024] = {0};
+
+        if (is_ip_on_interface(entries[i].address, entries[i].interface, entries[i].is_ipv6)) {
+            continue;
+        }
+
+        int ok = add_ip_to_interface(entries[i].address,
+                                     entries[i].interface,
+                                     entries[i].is_ipv6,
+                                     error_msg,
+                                     sizeof(error_msg));
+        printf("Managed IP restore: %s on %s -> %s (%s)\n",
+               entries[i].address,
+               entries[i].interface,
+               ok ? "restored" : "failed",
+               error_msg[0] ? error_msg : "no message");
+    }
+
+    free(entries);
+}
+
+static void *managed_ip_reconcile_thread(void *arg) {
+    (void)arg;
+
+    for (;;) {
+        sleep(MANAGED_IP_RESTORE_INTERVAL);
+        restore_managed_ips_once();
+    }
+
+    return NULL;
+}
+
 // Debug function to check current IPv6 status
 static void debug_ipv6_status(const char* ipv6_address) {
     printf("\n=== IPv6 DEBUG INFO for %s ===\n", ipv6_address);
@@ -1997,6 +2506,7 @@ static int remove_ipv6_address(const char* ipv6_address) {
             
             if (result == 0) {
                 printf("Successfully removed exact IP: %s\n", exact_ip);
+                untrack_managed_ip(ipv6_address, NULL);
                 pclose(fp);
                 return result;
             }
@@ -2028,6 +2538,7 @@ static int remove_ipv6_address(const char* ipv6_address) {
                     
                     if (result == 0) {
                         printf("Successfully removed with prefix /%d from %s\n", prefixes[i], interface);
+                        untrack_managed_ip(ipv6_address, interface);
                         pclose(fp);
                         return result;
                     }
@@ -2047,6 +2558,7 @@ static int remove_ipv6_address(const char* ipv6_address) {
     
     if (result != 0) {
         printf("Verified: IPv6 address %s is not present in system\n", ipv6_address);
+        untrack_managed_ip(ipv6_address, NULL);
         return 0; // Consider success if it doesn't exist
     } else {
         printf("IPv6 address %s still exists. Manual removal may be needed.\n", ipv6_address);
@@ -2093,6 +2605,7 @@ static int remove_ipv4_address(const char* ipv4_address) {
             int result = system(command);
             if (result == 0) {
                 printf("Successfully removed IPv4 address %s from %s\n", address_with_prefix, iface);
+                untrack_managed_ip(ipv4_address, iface);
             } else {
                 printf("Failed to remove IPv4 address %s from %s\n", address_with_prefix, iface);
             }
@@ -2109,6 +2622,7 @@ static int remove_ipv4_address(const char* ipv4_address) {
         snprintf(check_cmd, sizeof(check_cmd), "ip -4 addr show | grep -q '%s'", ipv4_address);
         if (system(check_cmd) != 0) {
             printf("IPv4 address %s not found on any interface. Assuming removed.\n", ipv4_address);
+            untrack_managed_ip(ipv4_address, NULL);
             return 0;
         }
         printf("IPv4 address %s still present. Manual removal may be required.\n", ipv4_address);
@@ -3418,7 +3932,7 @@ static int delete_proxy_by_username_simple(const char *username) {
         return -1;
     }
     
-    size_t out_pos = 0;  // efficient output position tracking (no O(nÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²))
+    size_t out_pos = 0;  // efficient output position tracking (no O(nÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²))
     new_config[0] = '\0';
     
     char *current = config;
@@ -4596,12 +5110,18 @@ static int remove_ip_from_interface(const char *ip_address, const char *interfac
     } else if (strstr(error_str, "Cannot assign") || strstr(error_str, "not found")) {
         // IP might not exist on the interface, that's OK
         snprintf(error_str, error_size, "IP not found or already removed");
-        return 0; // Treat as success
+        untrack_managed_ip(ip_address, interface);
+        return 1; // Treat as success
     }
     
     printf("IP remove result: exit code: %d, output: %s\n", result, output);
     
-    return (result == 0);
+    if (result == 0) {
+        untrack_managed_ip(ip_address, interface);
+        return 1;
+    }
+
+    return 0;
 }
 
 // Function to add IP address to interface
@@ -4631,16 +5151,23 @@ static int add_ip_to_interface(const char *ip_address, const char *interface, in
     strncpy(error_str, output, error_size - 1);
     error_str[error_size - 1] = '\0';
 
+    int already_exists = (strstr(output, "exists") != NULL);
+
     if(!strlen(error_str)) {
         snprintf(error_str, error_size, "Success");
-    } else if( strstr(error_str, "exists") ) {
+    } else if(already_exists) {
         snprintf(error_str, error_size, "Address exists");
     }
     
     printf("IP add result: %s, exit code: %d\n", command, result);
     printf("Output: %s\n", output);
     
-    return (result == 0);
+    if (result == 0 || already_exists) {
+        track_managed_ip(ip_address, interface, is_ipv6);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int add_ip_to_interface_with_cleanup(const char *old_ip, const char *new_ip, 
@@ -6331,7 +6858,7 @@ static void handle_change_protocol(struct mg_connection *c, struct mg_http_messa
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) {
@@ -6728,7 +7255,7 @@ static void handle_remove_blacklist(struct mg_connection *c, struct mg_http_mess
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -7146,7 +7673,7 @@ static void handle_add_blacklist(struct mg_connection *c, struct mg_http_message
         const char *line_end = strchr(cursor, '\n');
         if (!line_end) line_end = cursor + strlen(cursor);
         
-        // Extract line (dynamically allocated ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no truncation)
+        // Extract line (dynamically allocated ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no truncation)
         size_t line_len = line_end - cursor;
         char *line = malloc(line_len + 1);
         if (!line) { free(file_content); free(ports); free(port_found); free(port_had_blacklist); free(port_modified); free(block_lines); fclose(temp_file); if (port_obj) json_object_put(ports_obj); json_object_put(root); mg_http_reply(c, 500, "Content-Type: application/json\r\n", "{\"error\":\"Memory allocation failed\"}"); return; }
@@ -7784,6 +8311,16 @@ int main(int argc, char* argv[])
   
   if (!ensure_firewall_objects_once()) {
       fprintf(stderr, "Failed to initialize ipset/iptables firewall objects");
+  }
+
+  ensure_managed_ip_state_dir();
+  bootstrap_managed_ip_state_if_missing();
+  restore_managed_ips_once();
+
+  pthread_t managed_ip_thread;
+  rc = pthread_create(&managed_ip_thread, NULL, managed_ip_reconcile_thread, NULL);
+  if (rc != 0) {
+      fprintf(stderr, "Warning: Error creating managed IP reconcile thread: %d\n", rc);
   }
 
   struct mg_mgr mgr;  // Declare event manager
