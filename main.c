@@ -36,7 +36,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.5.5"
+#define VERSION_STRING "1.5.6"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -2123,10 +2123,16 @@ static int save_managed_ip_state(const ManagedIpEntry *entries, size_t count) {
     }
 
     for (size_t i = 0; i < count; i++) {
-        fprintf(fp, "%s %d %s\n",
+        int prefix_len = entries[i].prefix_len;
+        if (prefix_len <= 0) {
+            prefix_len = entries[i].is_ipv6 ? 128 : 32;
+        }
+
+        fprintf(fp, "%s %d %s %d\n",
                 entries[i].interface,
                 entries[i].is_ipv6,
-                entries[i].address);
+                entries[i].address,
+                prefix_len);
     }
 
     if (fclose(fp) != 0) {
@@ -2296,13 +2302,22 @@ static void restore_managed_ips_once(void) {
             continue;
         }
 
-        int ok = add_ip_to_interface(entries[i].address,
+        int prefix_len = entries[i].prefix_len;
+        if (prefix_len <= 0) {
+            prefix_len = entries[i].is_ipv6 ? 128 : 32;
+        }
+
+        char address_with_prefix[192];
+        snprintf(address_with_prefix, sizeof(address_with_prefix), "%s/%d",
+                 entries[i].address, prefix_len);
+
+        int ok = add_ip_to_interface(address_with_prefix,
                                      entries[i].interface,
                                      entries[i].is_ipv6,
                                      error_msg,
                                      sizeof(error_msg));
         printf("Managed IP restore: %s on %s -> %s (%s)\n",
-               entries[i].address,
+               address_with_prefix,
                entries[i].interface,
                ok ? "restored" : "failed",
                error_msg[0] ? error_msg : "no message");
@@ -5001,11 +5016,7 @@ static int add_ip_to_interface(const char *ip_address, const char *interface, in
     if (is_ipv6) {
         snprintf(command, sizeof(command), "ip -6 addr add %s/%d dev %s 2>&1", normalized_ip, prefix_len, interface);
     } else {
-        if (strchr(ip_address, '/') != NULL) {
-            snprintf(command, sizeof(command), "ip addr add %s dev %s 2>&1", ip_address, interface);
-        } else {
-            snprintf(command, sizeof(command), "ip addr add %s dev %s 2>&1", normalized_ip, interface);
-        }
+        snprintf(command, sizeof(command), "ip addr add %s/%d dev %s 2>&1", normalized_ip, prefix_len, interface);
     }
     
     FILE *fp = popen(command, "r");
