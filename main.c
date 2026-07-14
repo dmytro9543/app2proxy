@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <signal.h>
 #include <pthread.h>
 #include <sys/sysinfo.h>
@@ -18,6 +19,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <curl/curl.h>
 
 #include "mongoose.h"
 
@@ -36,7 +38,7 @@
 
 #define CURRENT_BINARY_PATH "/usr/bin/app2proxy"
 
-#define VERSION_STRING "1.5.6"
+#define VERSION_STRING "1.5.7"
 
 int main_pid = 0;
 int no_fork = 0;
@@ -96,6 +98,7 @@ char* test_proxy(const char* proxy, const char* tipo);
 char* test_all_proxies(const char* proxy);
 bool is_ipv4(const char* ip);
 bool is_ipv6(const char* ip);
+void handle_test_proxies_v1(struct mg_connection *c, struct mg_http_message *hm);
 void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_generate_ipv6(struct mg_connection *c, struct mg_http_message *hm);
 static void handle_delete_proxies(struct mg_connection *c, struct mg_http_message *hm);
@@ -1311,122 +1314,444 @@ bool is_ipv6(const char* ip) {
     return strchr(ip, ':') != NULL;
 }
 
-// Handle the /test-proxies endpoint
-void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm) {
-    // Parse JSON body
+// IP2Location.io enrichment for /test-proxies.
+// The legacy response remains available through /test-proxies-v1.
+#define IP2LOCATION_CACHE_SIZE 256
+#define IP2LOCATION_CACHE_TTL_SECONDS 86400
+#define IP2LOCATION_TIMEOUT_MS 3000L
+
+typedef struct {
+    int success;
+    char country_code[8];
+    char country_name[128];
+    char region_name[128];
+    char city_name[128];
+    char zip_code[32];
+    char time_zone[32];
+    char asn[32];
+    char as_name[256];
+    char isp[256];
+    int isp_is_as_fallback;
+    int is_proxy;
+    char error[256];
+} Ip2LocationResult;
+
+typedef struct {
+    int in_use;
+    char ip[128];
+    Ip2LocationResult result;
+    time_t expires_at;
+    time_t last_used;
+} Ip2LocationCacheEntry;
+
+typedef struct {
+    char *data;
+    size_t size;
+} CurlResponseBuffer;
+
+static Ip2LocationCacheEntry ip2location_cache[IP2LOCATION_CACHE_SIZE];
+static pthread_mutex_t ip2location_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t curl_global_once = PTHREAD_ONCE_INIT;
+
+static void initialize_curl_global(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+}
+
+static size_t ip2location_write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t real_size = size * nmemb;
+    CurlResponseBuffer *buffer = (CurlResponseBuffer *) userp;
+    char *new_data = realloc(buffer->data, buffer->size + real_size + 1);
+
+    if (!new_data) {
+        return 0;
+    }
+
+    buffer->data = new_data;
+    memcpy(buffer->data + buffer->size, contents, real_size);
+    buffer->size += real_size;
+    buffer->data[buffer->size] = '\0';
+    return real_size;
+}
+
+static void copy_json_string(json_object *root, const char *field, char *dest, size_t dest_size) {
+    json_object *value = NULL;
+    if (!dest || dest_size == 0) return;
+    dest[0] = '\0';
+
+    if (root && json_object_object_get_ex(root, field, &value) &&
+        json_object_is_type(value, json_type_string)) {
+        const char *text = json_object_get_string(value);
+        if (text) {
+            snprintf(dest, dest_size, "%s", text);
+        }
+    }
+}
+
+static int ip2location_cache_get(const char *ip, Ip2LocationResult *result) {
+    int found = 0;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&ip2location_cache_mutex);
+    for (int i = 0; i < IP2LOCATION_CACHE_SIZE; i++) {
+        if (ip2location_cache[i].in_use &&
+            ip2location_cache[i].expires_at > now &&
+            strcmp(ip2location_cache[i].ip, ip) == 0) {
+            *result = ip2location_cache[i].result;
+            ip2location_cache[i].last_used = now;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ip2location_cache_mutex);
+    return found;
+}
+
+static void ip2location_cache_put(const char *ip, const Ip2LocationResult *result) {
+    int target = -1;
+    time_t oldest = 0;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&ip2location_cache_mutex);
+    for (int i = 0; i < IP2LOCATION_CACHE_SIZE; i++) {
+        if (ip2location_cache[i].in_use && strcmp(ip2location_cache[i].ip, ip) == 0) {
+            target = i;
+            break;
+        }
+        if (!ip2location_cache[i].in_use || ip2location_cache[i].expires_at <= now) {
+            target = i;
+            break;
+        }
+        if (target < 0 || ip2location_cache[i].last_used < oldest) {
+            target = i;
+            oldest = ip2location_cache[i].last_used;
+        }
+    }
+
+    if (target >= 0) {
+        memset(&ip2location_cache[target], 0, sizeof(ip2location_cache[target]));
+        ip2location_cache[target].in_use = 1;
+        snprintf(ip2location_cache[target].ip, sizeof(ip2location_cache[target].ip), "%s", ip);
+        ip2location_cache[target].result = *result;
+        ip2location_cache[target].expires_at = now + IP2LOCATION_CACHE_TTL_SECONDS;
+        ip2location_cache[target].last_used = now;
+    }
+    pthread_mutex_unlock(&ip2location_cache_mutex);
+}
+
+static int lookup_ip2location(const char *ip, Ip2LocationResult *result) {
+    CURL *curl = NULL;
+    CURLcode curl_result;
+    long http_code = 0;
+    CurlResponseBuffer response = {0};
+    struct curl_slist *headers = NULL;
+    char auth_header[1024];
+    char url[2048];
+    char *escaped_ip = NULL;
+    const char *api_key = getenv("IP2LOCATION_API_KEY");
+    const char *enabled = getenv("IP2LOCATION_ENABLED");
+    const char *api_base_url = getenv("IP2LOCATION_API_URL");
+    json_object *root = NULL;
+    json_object *error_obj = NULL;
+    json_object *is_proxy_obj = NULL;
+
+    memset(result, 0, sizeof(*result));
+
+    if (enabled && (strcmp(enabled, "0") == 0 || strcasecmp(enabled, "false") == 0)) {
+        snprintf(result->error, sizeof(result->error), "IP2Location lookup disabled");
+        return 0;
+    }
+
+    if (!ip || (!is_ipv4(ip) && !is_ipv6(ip))) {
+        snprintf(result->error, sizeof(result->error), "Invalid exit IP");
+        return 0;
+    }
+
+    if (ip2location_cache_get(ip, result)) {
+        return result->success;
+    }
+
+    pthread_once(&curl_global_once, initialize_curl_global);
+    curl = curl_easy_init();
+    if (!curl) {
+        snprintf(result->error, sizeof(result->error), "Unable to initialize HTTP client");
+        return 0;
+    }
+
+    escaped_ip = curl_easy_escape(curl, ip, 0);
+    if (!escaped_ip) {
+        snprintf(result->error, sizeof(result->error), "Unable to encode IP address");
+        curl_easy_cleanup(curl);
+        return 0;
+    }
+
+    if (!api_base_url || api_base_url[0] == '\0') {
+        api_base_url = "https://api.ip2location.io/";
+    }
+    snprintf(url, sizeof(url), "%s%cip=%s&format=json", api_base_url,
+             strchr(api_base_url, '?') ? '&' : '?', escaped_ip);
+    curl_free(escaped_ip);
+
+    if (api_key && api_key[0] != '\0') {
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
+        headers = curl_slist_append(headers, auth_header);
+    }
+    headers = curl_slist_append(headers, "Accept: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ip2location_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, IP2LOCATION_TIMEOUT_MS);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, IP2LOCATION_TIMEOUT_MS);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "app2proxy/1.5.7");
+
+    curl_result = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (curl_result != CURLE_OK) {
+        snprintf(result->error, sizeof(result->error), "IP2Location request failed: %s",
+                 curl_easy_strerror(curl_result));
+        goto cleanup;
+    }
+
+    if (http_code < 200 || http_code >= 300 || !response.data) {
+        snprintf(result->error, sizeof(result->error), "IP2Location returned HTTP %ld", http_code);
+        goto cleanup;
+    }
+
+    root = json_tokener_parse(response.data);
+    if (!root || !json_object_is_type(root, json_type_object)) {
+        snprintf(result->error, sizeof(result->error), "Invalid IP2Location JSON response");
+        goto cleanup;
+    }
+
+    if (json_object_object_get_ex(root, "error", &error_obj)) {
+        json_object *message_obj = NULL;
+        if (json_object_is_type(error_obj, json_type_object) &&
+            json_object_object_get_ex(error_obj, "error_message", &message_obj) &&
+            json_object_is_type(message_obj, json_type_string)) {
+            snprintf(result->error, sizeof(result->error), "%s", json_object_get_string(message_obj));
+        } else {
+            snprintf(result->error, sizeof(result->error), "IP2Location provider error");
+        }
+        goto cleanup;
+    }
+
+    copy_json_string(root, "country_code", result->country_code, sizeof(result->country_code));
+    copy_json_string(root, "country_name", result->country_name, sizeof(result->country_name));
+    copy_json_string(root, "region_name", result->region_name, sizeof(result->region_name));
+    copy_json_string(root, "city_name", result->city_name, sizeof(result->city_name));
+    copy_json_string(root, "zip_code", result->zip_code, sizeof(result->zip_code));
+    copy_json_string(root, "time_zone", result->time_zone, sizeof(result->time_zone));
+    copy_json_string(root, "asn", result->asn, sizeof(result->asn));
+    copy_json_string(root, "as", result->as_name, sizeof(result->as_name));
+    copy_json_string(root, "isp", result->isp, sizeof(result->isp));
+
+    if (result->isp[0] == '\0' && result->as_name[0] != '\0') {
+        snprintf(result->isp, sizeof(result->isp), "%s", result->as_name);
+        result->isp_is_as_fallback = 1;
+    }
+
+    if (json_object_object_get_ex(root, "is_proxy", &is_proxy_obj)) {
+        result->is_proxy = json_object_get_boolean(is_proxy_obj);
+    }
+
+    result->success = 1;
+    ip2location_cache_put(ip, result);
+
+cleanup:
+    if (root) json_object_put(root);
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(response.data);
+    return result->success;
+}
+
+static void append_location_part(char *buffer, size_t buffer_size, const char *value, int *has_part) {
+    size_t used;
+    if (!value || value[0] == '\0' || !buffer || buffer_size == 0) return;
+    used = strlen(buffer);
+    if (used >= buffer_size - 1) return;
+    snprintf(buffer + used, buffer_size - used, "%s%s", *has_part ? ", " : "", value);
+    *has_part = 1;
+}
+
+static char *format_enriched_proxy_result(const char *basic_result, const char *ip) {
+    Ip2LocationResult location;
+    char location_text[512] = "";
+    char enriched[2048];
+    int has_location = 0;
+
+    if (!basic_result || !ip || !lookup_ip2location(ip, &location)) {
+        return basic_result ? strdup(basic_result) : NULL;
+    }
+
+    append_location_part(location_text, sizeof(location_text), location.city_name, &has_location);
+    append_location_part(location_text, sizeof(location_text), location.region_name, &has_location);
+    append_location_part(location_text, sizeof(location_text), location.country_name, &has_location);
+
+    snprintf(enriched, sizeof(enriched), "%s", basic_result);
+    if (location_text[0] != '\0') {
+        size_t used = strlen(enriched);
+        snprintf(enriched + used, sizeof(enriched) - used, " | %s", location_text);
+    }
+    if (location.isp[0] != '\0') {
+        size_t used = strlen(enriched);
+        snprintf(enriched + used, sizeof(enriched) - used, " | ISP%s: %s",
+                 location.isp_is_as_fallback ? "/AS" : "", location.isp);
+    }
+    if (location.asn[0] != '\0') {
+        size_t used = strlen(enriched);
+        snprintf(enriched + used, sizeof(enriched) - used, " | ASN: %s", location.asn);
+    }
+    {
+        size_t used = strlen(enriched);
+        snprintf(enriched + used, sizeof(enriched) - used, " | Geo: IP2Location.io");
+    }
+
+    return strdup(enriched);
+}
+
+static char *build_basic_proxy_result(const char *proxy, const char *type, char **exit_ip_out) {
+    char *result = NULL;
+    char *ip_result = NULL;
+    const char *protocol = "unknown";
+
+    if (exit_ip_out) *exit_ip_out = NULL;
+
+    if (strcmp(type, "any") == 0) {
+        const char *types[] = {"http-ipv6", "socks5-ipv4", "socks5-ipv6"};
+        for (int i = 0; i < 3; i++) {
+            ip_result = test_proxy(proxy, types[i]);
+            if (!ip_result) continue;
+
+            if (strcmp(types[i], "http-ipv6") == 0) protocol = "http-ipv6";
+            else if (is_ipv4(ip_result)) protocol = "socks5-ipv4";
+            else if (is_ipv6(ip_result)) protocol = "socks5-ipv6";
+
+            result = malloc(strlen(ip_result) + strlen(protocol) + 4);
+            if (result) sprintf(result, "%s (%s)", ip_result, protocol);
+            break;
+        }
+    } else {
+        ip_result = test_proxy(proxy, type);
+        if (ip_result) {
+            if (strcmp(type, "http-ipv6") == 0) protocol = "http-ipv6";
+            else if (is_ipv4(ip_result)) protocol = "socks5-ipv4";
+            else if (is_ipv6(ip_result)) protocol = "socks5-ipv6";
+
+            result = malloc(strlen(ip_result) + strlen(protocol) + 4);
+            if (result) sprintf(result, "%s (%s)", ip_result, protocol);
+        }
+    }
+
+    if (ip_result) {
+        if (exit_ip_out) *exit_ip_out = strdup(ip_result);
+        free(ip_result);
+    }
+    return result;
+}
+
+static void handle_test_proxies_common(struct mg_connection *c, struct mg_http_message *hm, int enrich) {
     char *body_str = malloc(hm->body.len + 1);
     if (!body_str) {
-        mg_http_reply(c, 500, "Content-Type: application/json\r\n", 
+        mg_http_reply(c, 500, "Content-Type: application/json\r\n",
                       "{\"error\":\"Memory allocation failed\"}");
         return;
     }
-    
+
     memcpy(body_str, hm->body.buf, hm->body.len);
     body_str[hm->body.len] = '\0';
-    
-    // Parse JSON using json-c
+
     json_object *root = json_tokener_parse(body_str);
     free(body_str);
-    
+
     if (!root) {
-        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
                       "{\"error\":\"Invalid JSON\"}");
         return;
     }
-    
-    // Extract type
+
     json_object *type_obj;
-    if (!json_object_object_get_ex(root, "type", &type_obj) || 
+    if (!json_object_object_get_ex(root, "type", &type_obj) ||
         !json_object_is_type(type_obj, json_type_string)) {
         json_object_put(root);
-        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
                       "{\"error\":\"Invalid or missing type\"}");
         return;
     }
-    
+
     const char *type = json_object_get_string(type_obj);
-    
-    // Check if type is valid
-    if (strcmp(type, "http-ipv6") != 0 && 
-        strcmp(type, "socks5-ipv6") != 0 && 
-        strcmp(type, "socks5-ipv4") != 0 && 
+    if (strcmp(type, "http-ipv6") != 0 &&
+        strcmp(type, "socks5-ipv6") != 0 &&
+        strcmp(type, "socks5-ipv4") != 0 &&
         strcmp(type, "any") != 0) {
         json_object_put(root);
-        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
                       "{\"error\":\"Invalid proxy type\"}");
         return;
     }
-    
-    // Extract proxies array
+
     json_object *proxies_obj;
-    if (!json_object_object_get_ex(root, "proxies", &proxies_obj) || 
+    if (!json_object_object_get_ex(root, "proxies", &proxies_obj) ||
         !json_object_is_type(proxies_obj, json_type_array)) {
         json_object_put(root);
-        mg_http_reply(c, 400, "Content-Type: application/json\r\n", 
+        mg_http_reply(c, 400, "Content-Type: application/json\r\n",
                       "{\"error\":\"Invalid or missing proxies array\"}");
         return;
     }
-    
-    // Create response object
+
     json_object *response_obj = json_object_new_object();
-    
-    // Process each proxy
     int array_len = json_object_array_length(proxies_obj);
+
     for (int i = 0; i < array_len; i++) {
         json_object *proxy_item = json_object_array_get_idx(proxies_obj, i);
-        
-        if (!json_object_is_type(proxy_item, json_type_string)) {
-            continue; // Skip non-string items
-        }
-        
+        char *exit_ip = NULL;
+        char *basic_result = NULL;
+        char *final_result = NULL;
+
+        if (!json_object_is_type(proxy_item, json_type_string)) continue;
+
         const char *proxy = json_object_get_string(proxy_item);
-        if (strlen(proxy) < 4) { // Minimum valid proxy length
+        if (strlen(proxy) < 4) {
             json_object_object_add(response_obj, proxy, json_object_new_string("invalid"));
             continue;
         }
-        
-        char *result = NULL;
-        
-        if (strcmp(type, "any") == 0) {
-            result = test_all_proxies(proxy);
-        } else {
-            char *ip_result = test_proxy(proxy, type);
-            if (ip_result) {
-                // Determine protocol based on IP type
-                const char *protocol;
-                if (strcmp(type, "http-ipv6") == 0) {
-                    protocol = "http-ipv6";
-                } else if (is_ipv4(ip_result)) {
-                    protocol = "socks5-ipv4";
-                } else if (is_ipv6(ip_result)) {
-                    protocol = "socks5-ipv6";
-                } else {
-                    protocol = "unknown";
-                }
-                
-                result = malloc(strlen(ip_result) + strlen(protocol) + 4);
-                if (result) {
-                    sprintf(result, "%s (%s)", ip_result, protocol);
-                }
-                free(ip_result);
-            }
-        }
-        
-        if (result) {
-            json_object_object_add(response_obj, proxy, json_object_new_string(result));
-            free(result);
+
+        basic_result = build_basic_proxy_result(proxy, type, &exit_ip);
+        if (basic_result) {
+            final_result = enrich ? format_enriched_proxy_result(basic_result, exit_ip)
+                                  : strdup(basic_result);
+            json_object_object_add(response_obj, proxy,
+                                   json_object_new_string(final_result ? final_result : basic_result));
         } else {
             json_object_object_add(response_obj, proxy, json_object_new_string("offline"));
         }
+
+        free(final_result);
+        free(basic_result);
+        free(exit_ip);
     }
-    
-    // Generate response string
+
     const char *response_str = json_object_to_json_string(response_obj);
     mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", response_str);
-    
-    // Cleanup
+
     json_object_put(response_obj);
     json_object_put(root);
+}
+
+// Legacy endpoint: exact pre-IP2Location behavior and response format.
+void handle_test_proxies_v1(struct mg_connection *c, struct mg_http_message *hm) {
+    handle_test_proxies_common(c, hm, 0);
+}
+
+// Current endpoint: same request and response shape, enriched string values.
+void handle_test_proxies(struct mg_connection *c, struct mg_http_message *hm) {
+    handle_test_proxies_common(c, hm, 1);
 }
 
 void generate_ipv6_suffix(char *suffix) {
@@ -2590,7 +2915,7 @@ static int restart_3proxy_service() {
 }
 
 // Function to delete proxies from 3proxy configuration - FIXED VERSION
-static int delete_proxies_from_config(const char** usernames, int count, const char** deleted_users, int* deleted_count,  char** removed_ipv6_addresses, int* ipv6_count, char** removed_ipv4_addresses, int* ipv4_count) {
+static int delete_proxies_from_config(const char** usernames, int count, char** deleted_users, int* deleted_count,  char** removed_ipv6_addresses, int* ipv6_count, char** removed_ipv4_addresses, int* ipv4_count) {
 
     printf("Starting delete_proxies_from_config\n");
     
@@ -2820,7 +3145,7 @@ static int delete_proxies_from_config(const char** usernames, int count, const c
                             if (strcmp(username, usernames[i]) == 0) {
                                 keep_user = 0;
                                 users_removed++;
-                                deleted_users[(*deleted_count)++] = usernames[i];
+                                deleted_users[(*deleted_count)++] = (char *) usernames[i];
                                 printf("Removing user from users line: %s\n", username);
                                 break;
                             }
@@ -8031,7 +8356,11 @@ static void api_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         
       }
       
-      if (mg_match(hm->uri, mg_str("/test-proxies"), NULL)) {
+      if (mg_match(hm->uri, mg_str("/test-proxies-v1"), NULL)) {
+        handle_test_proxies_v1(c, hm);
+        if (modifies_config) log_api_completion(uri, 1);
+      }
+      else if (mg_match(hm->uri, mg_str("/test-proxies"), NULL)) {
         handle_test_proxies(c, hm);
         if (modifies_config) log_api_completion(uri, 1);
       }
